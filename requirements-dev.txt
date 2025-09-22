@@ -1,0 +1,5 @@
+torch
+coverage        # test coverage
+ruff            # lint
+mypy            # type checking (if you add hints)
+build           # packaging (python -m build)
