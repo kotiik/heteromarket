@@ -2,6 +2,12 @@ import importlib
 import unittest
 import torch
 
+import numpy as np
+import jax
+from jax import numpy as jnp
+from jax.scipy.sparse.linalg import gmres as jax_gmres
+
+
 _core = importlib.import_module("heteromarket.core")
 GMRESSolver = _core.GMRESSolver
 bdot = _core.bdot
