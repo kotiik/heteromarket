@@ -1882,18 +1882,18 @@ def find_equilibrium_prices(
 ):
     if Sigma.ndim == 2:
         return PriceSolver.apply(
-            torch.as_tensor(Sigma, dtype=torch.float64).unsqueeze(-1),
-            torch.as_tensor(expected_returns, dtype=torch.float64).unsqueeze(-1),
-            torch.as_tensor(comission, dtype=torch.float64).unsqueeze(-1),
-            torch.as_tensor(holdings, dtype=torch.float64).unsqueeze(-1),
-            torch.as_tensor(budget, dtype=torch.float64).unsqueeze(-1),
-            torch.as_tensor(short_leverage, dtype=torch.float64).unsqueeze(-1),
-            torch.as_tensor(long_leverage, dtype=torch.float64).unsqueeze(-1),
-            torch.as_tensor(supply, dtype=torch.float64).unsqueeze(-1),
+            torch.as_tensor(Sigma, dtype=torch.float64).unsqueeze(0),
+            torch.as_tensor(expected_returns, dtype=torch.float64).unsqueeze(0),
+            torch.as_tensor(comission, dtype=torch.float64).unsqueeze(0),
+            torch.as_tensor(holdings, dtype=torch.float64).unsqueeze(0),
+            torch.as_tensor(budget, dtype=torch.float64).unsqueeze(0),
+            torch.as_tensor(short_leverage, dtype=torch.float64).unsqueeze(0),
+            torch.as_tensor(long_leverage, dtype=torch.float64).unsqueeze(0),
+            torch.as_tensor(supply, dtype=torch.float64).unsqueeze(0),
             (
                 None
                 if initial_approximation is None
-                else torch.as_tensor(initial_approximation, dtype=torch.float64).unsqueeze(-1)
+                else torch.as_tensor(initial_approximation, dtype=torch.float64).unsqueeze(0)
             ),
         )
     else:
