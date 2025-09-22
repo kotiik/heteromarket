@@ -1932,7 +1932,7 @@ def find_equilibrium_prices(
     return PriceSolver.apply(
         torch.as_tensor(Sigma, dtype=torch.float64),
         torch.as_tensor(expected_returns, dtype=torch.float64),
-        torch.as_tensor(comission, dtype=torch.float64),
+        torch.as_tensor(commission, dtype=torch.float64),
         torch.as_tensor(holdings, dtype=torch.float64),
         torch.as_tensor(budget, dtype=torch.float64),
         torch.as_tensor(short_leverage, dtype=torch.float64),
@@ -1948,7 +1948,7 @@ def find_equilibrium_prices(
 def optimize_portfolio(
     Sigma,
     expected_returns,
-    comission,
+    commission,
     holdings,
     budget,
     short_leverage,
@@ -2012,7 +2012,7 @@ def optimize_portfolio(
         ssolv = StockSolver(
             torch.as_tensor(Sigma, dtype=torch.float64).unsqueeze(0),
             torch.as_tensor(expected_returns, dtype=torch.float64).unsqueeze(0),
-            torch.as_tensor(comission, dtype=torch.float64).unsqueeze(0),
+            torch.as_tensor(commission, dtype=torch.float64).unsqueeze(0),
             torch.as_tensor(holdings, dtype=torch.float64).unsqueeze(0),
             torch.as_tensor(budget, dtype=torch.float64).unsqueeze(0),
             torch.as_tensor(short_leverage, dtype=torch.float64).unsqueeze(0),
@@ -2022,7 +2022,7 @@ def optimize_portfolio(
         ssolv = StockSolver(
             torch.as_tensor(Sigma, dtype=torch.float64),
             torch.as_tensor(expected_returns, dtype=torch.float64),
-            torch.as_tensor(comission, dtype=torch.float64),
+            torch.as_tensor(commission, dtype=torch.float64),
             torch.as_tensor(holdings, dtype=torch.float64),
             torch.as_tensor(budget, dtype=torch.float64),
             torch.as_tensor(short_leverage, dtype=torch.float64),
