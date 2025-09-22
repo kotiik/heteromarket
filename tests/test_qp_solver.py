@@ -1,5 +1,6 @@
 import importlib
 import unittest
+import torch
 from torch.autograd.forward_ad import dual_level, make_dual, unpack_dual
 from torch.autograd import grad
 
