@@ -3,7 +3,7 @@ import unittest
 import torch
 
 _core = importlib.import_module("heteromarket.core")
-StockSover = _core.StockSover
+StockSolver = _core.StockSolver
 
 class TestActiveSetQPSolverInit(unittest.TestCase):
     @staticmethod
