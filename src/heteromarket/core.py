@@ -1880,6 +1880,55 @@ def find_equilibrium_prices(
     supply,
     initial_approximation=None,
 ):
+    """
+    Compute market-clearing (equilibrium) prices for a *batch* of heterogeneous-agent markets.
+
+    This function **only accepts batched inputs** (single instances are disallowed).
+    All parameters must be stacked along dimension 0 (batch). Outputs are (B, N).
+
+    Accepts PyTorch tensors or array-likes convertible to tensors and fully supports autograd,
+    enabling gradient-based calibration and inference (e.g., MCMC/NUTS).
+
+    Parameters
+    ----------
+    Sigma : (B, N, N)
+        Expected covariance matrices (PSD) per batch item.
+    expected_returns : (B, N)
+        Expected returns per asset per batch item.
+    commission : (B, N)
+        Per-asset commission to **buy**. Use zeros for initial portfolios.
+    holdings : (B, N)
+        Current holdings per batch item. Use zeros for initial portfolios.
+    budget : (B,)
+        Total budget per batch item.
+    short_leverage : (B,) or (B, N)
+        Per-security short cap as a fraction of `budget`. `0` ⇒ no short sales.
+    long_leverage : (B,) or (B, N)
+        Per-security long cap as a fraction of `budget`. Values < 1 ⇒ no leverage.
+    supply : (B, N)
+        Exogenous supply of each security per batch item.
+    initial_approximation : (B, N), optional
+        **Strictly positive** initial guess for prices. It should not affect the final equilibrium,
+        but a good guess can improve performance when close to equilibrium.
+
+    Returns
+    -------
+    equilibrium_prices : (B, N) torch.Tensor
+        Market-clearing price vectors (aggregate demand ≈ supply per batch).
+
+    Notes
+    -----
+    - **Batched only**: all inputs (including `initial_approximation`, if provided) must be batched.
+    - Fully differentiable; non-tensors are converted to tensors.
+
+    Examples
+    --------
+    >>> p_eq = find_equilibrium_prices(
+    ...     Sigma_b, mu_b, commission_b, holdings_b, budget_b,
+    ...     short_leverage_b, long_leverage_b, supply_b,
+    ...     initial_approximation=torch.ones_like(supply_b)
+    ... )
+    """    
     return PriceSolver.apply(
         torch.as_tensor(Sigma, dtype=torch.float64),
         torch.as_tensor(expected_returns, dtype=torch.float64),
@@ -1906,6 +1955,59 @@ def optimize_portfolio(
     long_leverage,
     prices,
 ):
+    """
+    Optimize a single portfolio or a batch of portfolios under budget, short, and long leverage constraints.
+
+    Batching
+    --------
+    Supports single or batched optimization. When batched, **all parameters except `prices` must be
+    stacked along dimension 0** (the batch dimension). **`prices` is a market-wide vector shared by
+    everyone and MUST be unbatched** (shape (N,)); it will be internally broadcast across the batch.
+
+    The method accepts PyTorch tensors or any array-like objects convertible to `torch.Tensor`,
+    and is fully differentiable (autograd-friendly).
+
+    Parameters
+    ----------
+    Sigma : (N, N) or (B, N, N)
+        Expected covariance matrix (PSD). Batched as (B, N, N).
+    expected_returns : (N,) or (B, N)
+        Expected returns. Batched as (B, N).
+    commission : (N,) or (B, N)
+        Per-asset commission to **buy**. Use zeros for initial portfolios.
+    holdings : (N,) or (B, N)
+        Current holdings (shares). Use zeros for initial portfolios.
+    budget : () or (B,)
+        Total budget (scalar or batched scalar).
+    short_leverage : () or (N,) or (B,) or (B, N)
+        Per-security short cap as a fraction of `budget`. `0` ⇒ no short sales.
+    long_leverage : () or (N,) or (B,) or (B, N)
+        Per-security long cap as a fraction of `budget`. Values < 1 ⇒ no leverage.
+    prices : (N,)
+        **Market prices** shared by all agents. **Must be 1-D (N,)**; batches are not allowed.
+
+    Returns
+    -------
+    optimal_holdings : (N,) or (B, N) torch.Tensor
+        Optimal post-trade holdings satisfying constraints.
+
+    Notes
+    -----
+    - `prices` is **unbatched** by design (market-wide).
+    - All other inputs follow the single vs. batched rules above.
+    - Fully differentiable; non-tensors are converted to tensors.
+
+    Examples
+    --------
+    Single portfolio
+    >>> h = optimize_portfolio(Sigma, mu, commission=torch.zeros_like(mu),
+    ...     holdings=torch.zeros_like(mu), budget=1.0,
+    ...     short_leverage=0.0, long_leverage=1.0, prices=prices)
+
+    Batched portfolios (B, N) with shared market prices (N,)
+    >>> h_b = optimize_portfolio(Sigma_b, mu_b, commission_b, holdings_b,
+    ...     budget_b, short_leverage=0.0, long_leverage=1.0, prices=prices)
+    """    
     if Sigma.ndim == 2:
         ssolv = StockSolver(
             torch.as_tensor(Sigma, dtype=torch.float64).unsqueeze(0),
