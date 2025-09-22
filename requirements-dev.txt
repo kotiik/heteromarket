@@ -1,5 +1,6 @@
 numpy
 torch
+jax
 coverage        # test coverage
 ruff            # lint
 mypy            # type checking (if you add hints)
