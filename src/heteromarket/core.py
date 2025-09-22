@@ -1872,7 +1872,7 @@ def compute_initial_prices(Sigma, M, budget, kappa, theta, S, p0=None):
 def find_equilibrium_prices(
     Sigma,
     expected_returns,
-    comission,
+    commission,
     holdings,
     budget,
     short_leverage,
@@ -1880,39 +1880,21 @@ def find_equilibrium_prices(
     supply,
     initial_approximation=None,
 ):
-    if Sigma.ndim == 2:
-        return PriceSolver.apply(
-            torch.as_tensor(Sigma, dtype=torch.float64).unsqueeze(0),
-            torch.as_tensor(expected_returns, dtype=torch.float64).unsqueeze(0),
-            torch.as_tensor(comission, dtype=torch.float64).unsqueeze(0),
-            torch.as_tensor(holdings, dtype=torch.float64).unsqueeze(0),
-            torch.as_tensor(budget, dtype=torch.float64).unsqueeze(0),
-            torch.as_tensor(short_leverage, dtype=torch.float64).unsqueeze(0),
-            torch.as_tensor(long_leverage, dtype=torch.float64).unsqueeze(0),
-            torch.as_tensor(supply, dtype=torch.float64).unsqueeze(0),
-            (
-                None
-                if initial_approximation is None
-                else torch.as_tensor(initial_approximation, dtype=torch.float64).unsqueeze(0)
-            ),
-        )
-    else:
-        return PriceSolver.apply(
-            torch.as_tensor(Sigma, dtype=torch.float64),
-            torch.as_tensor(expected_returns, dtype=torch.float64),
-            torch.as_tensor(comission, dtype=torch.float64),
-            torch.as_tensor(holdings, dtype=torch.float64),
-            torch.as_tensor(budget, dtype=torch.float64),
-            torch.as_tensor(short_leverage, dtype=torch.float64),
-            torch.as_tensor(long_leverage, dtype=torch.float64),
-            torch.as_tensor(supply, dtype=torch.float64),
-            (
-                None
-                if initial_approximation is None
-                else torch.as_tensor(initial_approximation, dtype=torch.float64)
-            ),
-        )
-
+    return PriceSolver.apply(
+        torch.as_tensor(Sigma, dtype=torch.float64),
+        torch.as_tensor(expected_returns, dtype=torch.float64),
+        torch.as_tensor(comission, dtype=torch.float64),
+        torch.as_tensor(holdings, dtype=torch.float64),
+        torch.as_tensor(budget, dtype=torch.float64),
+        torch.as_tensor(short_leverage, dtype=torch.float64),
+        torch.as_tensor(long_leverage, dtype=torch.float64),
+        torch.as_tensor(supply, dtype=torch.float64),
+        (
+            None
+            if initial_approximation is None
+            else torch.as_tensor(initial_approximation, dtype=torch.float64)
+        ),
+    )
 
 def optimize_portfolio(
     Sigma,
@@ -1924,13 +1906,24 @@ def optimize_portfolio(
     long_leverage,
     prices,
 ):
-    ssolv = StockSolver(
-        torch.as_tensor(Sigma, dtype=torch.float64),
-        torch.as_tensor(expected_returns, dtype=torch.float64),
-        torch.as_tensor(comission, dtype=torch.float64),
-        torch.as_tensor(holdings, dtype=torch.float64),
-        torch.as_tensor(budget, dtype=torch.float64),
-        torch.as_tensor(short_leverage, dtype=torch.float64),
-        torch.as_tensor(long_leverage, dtype=torch.float64),
-    )
+    if Sigma.ndim == 2:
+        ssolv = StockSolver(
+            torch.as_tensor(Sigma, dtype=torch.float64).unsqueeze(0),
+            torch.as_tensor(expected_returns, dtype=torch.float64).unsqueeze(0),
+            torch.as_tensor(comission, dtype=torch.float64).unsqueeze(0),
+            torch.as_tensor(holdings, dtype=torch.float64).unsqueeze(0),
+            torch.as_tensor(budget, dtype=torch.float64).unsqueeze(0),
+            torch.as_tensor(short_leverage, dtype=torch.float64).unsqueeze(0),
+            torch.as_tensor(long_leverage, dtype=torch.float64).unsqueeze(0),
+        )        
+    else:
+        ssolv = StockSolver(
+            torch.as_tensor(Sigma, dtype=torch.float64),
+            torch.as_tensor(expected_returns, dtype=torch.float64),
+            torch.as_tensor(comission, dtype=torch.float64),
+            torch.as_tensor(holdings, dtype=torch.float64),
+            torch.as_tensor(budget, dtype=torch.float64),
+            torch.as_tensor(short_leverage, dtype=torch.float64),
+            torch.as_tensor(long_leverage, dtype=torch.float64),
+        )
     return ssolv(torch.as_tensor(prices, dtype=torch.float64))
