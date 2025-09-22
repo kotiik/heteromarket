@@ -113,6 +113,3 @@ p_eq = find_equilibrium_prices(
 * Both functions are **autograd-friendly**.
 * Designed for use in **optimization pipelines, calibration, and Bayesian inference**.
 
----
-
-Would you like me to also add a **“Quickstart” section** to the README (installation + minimal working example)? That makes the repo easier to use for first-time visitors.
