@@ -1880,21 +1880,38 @@ def find_equilibrium_prices(
     supply,
     initial_approximation=None,
 ):
-    return PriceSolver.apply(
-        torch.as_tensor(Sigma, dtype=torch.float64),
-        torch.as_tensor(expected_returns, dtype=torch.float64),
-        torch.as_tensor(comission, dtype=torch.float64),
-        torch.as_tensor(holdings, dtype=torch.float64),
-        torch.as_tensor(budget, dtype=torch.float64),
-        torch.as_tensor(short_leverage, dtype=torch.float64),
-        torch.as_tensor(long_leverage, dtype=torch.float64),
-        torch.as_tensor(supply, dtype=torch.float64),
-        (
-            None
-            if initial_approximation is None
-            else torch.as_tensor(initial_approximation, dtype=torch.float64)
-        ),
-    )
+    if Sigma.ndim == 2:
+        return PriceSolver.apply(
+            torch.as_tensor(Sigma, dtype=torch.float64).unsqueeze(-1),
+            torch.as_tensor(expected_returns, dtype=torch.float64).unsqueeze(-1),
+            torch.as_tensor(comission, dtype=torch.float64).unsqueeze(-1),
+            torch.as_tensor(holdings, dtype=torch.float64).unsqueeze(-1),
+            torch.as_tensor(budget, dtype=torch.float64).unsqueeze(-1),
+            torch.as_tensor(short_leverage, dtype=torch.float64).unsqueeze(-1),
+            torch.as_tensor(long_leverage, dtype=torch.float64).unsqueeze(-1),
+            torch.as_tensor(supply, dtype=torch.float64).unsqueeze(-1),
+            (
+                None
+                if initial_approximation is None
+                else torch.as_tensor(initial_approximation, dtype=torch.float64).unsqueeze(-1)
+            ),
+        )
+    else:
+        return PriceSolver.apply(
+            torch.as_tensor(Sigma, dtype=torch.float64),
+            torch.as_tensor(expected_returns, dtype=torch.float64),
+            torch.as_tensor(comission, dtype=torch.float64),
+            torch.as_tensor(holdings, dtype=torch.float64),
+            torch.as_tensor(budget, dtype=torch.float64),
+            torch.as_tensor(short_leverage, dtype=torch.float64),
+            torch.as_tensor(long_leverage, dtype=torch.float64),
+            torch.as_tensor(supply, dtype=torch.float64),
+            (
+                None
+                if initial_approximation is None
+                else torch.as_tensor(initial_approximation, dtype=torch.float64)
+            ),
+        )
 
 
 def optimize_portfolio(
