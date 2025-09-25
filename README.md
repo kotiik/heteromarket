@@ -70,7 +70,7 @@ h_b = optimize_portfolio(
 
 Compute market-clearing (equilibrium) prices for a batch of heterogeneous-agent markets.
 
-* **Batched only**: all inputs must have leading dimension `B`.
+* **Batched only**: all inputs except prices must have leading dimension `B`.
 * `initial_approximation` is optional, must be positive, and only affects convergence speed (not results).
 
 ### Parameters
@@ -82,8 +82,8 @@ Compute market-clearing (equilibrium) prices for a batch of heterogeneous-agent 
 * **`budget`** `(B,)`: Budget per batch item.
 * **`short_leverage`** `(B,)` or `(B, N)`: Short-sale cap (fraction of budget).
 * **`long_leverage`** `(B,)` or `(B, N)`: Long position cap (fraction of budget).
-* **`supply`** `(B, N)`: Exogenous asset supply.
-* **`initial_approximation`** `(B, N)`, optional: Positive initial guess for prices. Improves performance if close to equilibrium.
+* **`supply`** `(N,)`: Exogenous asset supply.
+* **`initial_approximation`** `(N,)`, optional: Positive initial guess for prices. Improves performance if close to equilibrium.
 
 ### Returns
 
