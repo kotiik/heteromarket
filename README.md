@@ -39,7 +39,47 @@ Optimize a single portfolio or a batch of portfolios under budget, short, and lo
 
 * **`optimal_holdings`** `(N,)` or `(B, N)`: Optimal post-trade holdings.
 
-### Example
+### Example 1
+
+```python
+from heteromarket import optimize_portfolio
+import torch
+import numpy as np
+
+# expected prices
+M = np.array([50.15707481, 49.95627699, 50.2048171])
+# real prices
+prices = np.array([50.0, 50.0, 50.0])
+# covariance matrix
+Sigma = np.array(
+    [[0.0737, 0.0354, 0.0183], 
+     [0.0354, 0.0572, 0.0242], 
+     [0.0183, 0.0242, 0.0153]]
+)
+
+# Single portfolio
+h = optimize_portfolio(
+    Sigma, M,
+    commission=0.0,
+    holdings=np.zeros(3),
+    budget=1019.2129,
+    short_leverage=0.1363,
+    long_leverage=0.6878,
+    prices=prices
+)
+
+print("Optimal portfolio : ", h)
+```
+
+Expected result:
+
+```
+Optimal portfolio :  tensor([[-0.3851, -2.7784,  9.5275]], dtype=torch.float64)
+```
+
+---
+
+### Example 2
 
 ```python
 from heteromarket import optimize_portfolio
