@@ -229,10 +229,6 @@ print('Gradient of Sigma[0] :\n',Sigma.grad[0])
 print('Gradient of M :\n',M.grad)
 ```
 
-expected output:
-```
-Equilibrium prices: tensor([29.2456, 32.4128, 20.9177], dtype=torch.float64)
-```
 
 ---
 
