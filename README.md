@@ -129,19 +129,109 @@ Compute market-clearing (equilibrium) prices for a batch of heterogeneous-agent 
 
 * **`equilibrium_prices`** `(B, N)`: Market-clearing prices.
 
-### Example
+### Example 1
 
 ```python
 from heteromarket import find_equilibrium_prices
 import torch
+import pyro
+import pyro.distributions as dist
 
-p_eq = find_equilibrium_prices(
-    Sigma_b, mu_b,
-    commission_b, holdings_b, budget_b,
-    short_leverage_b, long_leverage_b,
-    supply_b,
-    initial_approximation=torch.ones_like(supply_b)
-)
+n, B = 3, 20
+pyro.set_rng_seed(42)
+
+V0 = torch.eye(n) * 50.0
+m0 = torch.ones(n)
+df = 4
+k0 = 10.0
+# c_a = 2.0
+# c_scale = 0.005
+budget_b = 10.0
+budget_scale = 130000.0
+kappa_a = 1.0
+kappa_b = 4.0
+theta_a = 2.0
+theta_b = 2.0
+lam_a = 1.0
+lam_scale = 0.1
+
+scale = V0 / df
+scale_tril = torch.linalg.cholesky(scale)
+
+# --- Priors ---
+with pyro.plate("B", B):
+    M = pyro.sample("M", dist.MultivariateNormal(m0, covariance_matrix=V0 / k0))
+    Sigma = pyro.sample(
+        "Sigma",
+        dist.Wishart(df=df, scale_tril=scale_tril),
+    )
+    c = torch.zeros((B,))
+    budget = pyro.sample("budget", dist.Pareto(budget_scale, budget_b))
+    kappa = pyro.sample("kappa", dist.Beta(kappa_a, kappa_b))
+    theta = pyro.sample("theta", dist.Beta(theta_a, theta_b)) / n * (n - 1) + 1 / n
+    S = torch.ones(n) * 10000.0
+
+x_opt = find_equilibrium_prices(Sigma, M, c, torch.zeros_like(M), budget, kappa, theta, S)
+print("Equilibrium prices:", x_opt)
+```
+
+expected output:
+```
+Equilibrium prices: tensor([29.2456, 32.4128, 20.9177], dtype=torch.float64)
+```
+---
+
+### Example 2
+
+```python
+from heteromarket import find_equilibrium_prices
+import torch
+import pyro
+import pyro.distributions as dist
+
+n, B = 3, 20
+pyro.set_rng_seed(42)
+
+V0 = torch.eye(n) * 50.0
+m0 = torch.ones(n)
+df = 4
+k0 = 10.0
+
+budget_b = 10.0
+budget_scale = 130000.0
+kappa_a = 1.0
+kappa_b = 4.0
+theta_a = 2.0
+theta_b = 2.0
+
+scale = V0 / df
+scale_tril = torch.linalg.cholesky(scale)
+
+# --- Priors ---
+with pyro.plate("B", B):
+    M = pyro.sample("M", dist.MultivariateNormal(m0, covariance_matrix=V0 / k0))
+    Sigma = pyro.sample(
+        "Sigma",
+        dist.Wishart(df=df, scale_tril=scale_tril),
+    )
+    c = torch.zeros((B,))
+    budget = pyro.sample("budget", dist.Pareto(budget_scale, budget_b))
+    kappa = pyro.sample("kappa", dist.Beta(kappa_a, kappa_b))
+    theta = pyro.sample("theta", dist.Beta(theta_a, theta_b)) / n * (n - 1) + 1 / n
+    S = torch.ones(n) * 10000.0
+
+Sigma.requires_grad_(True)
+M.requires_grad_(True)
+x_opt = find_equilibrium_prices(Sigma, M, c, torch.zeros_like(M), budget, kappa, theta, S)
+x_opt[0].backward()
+
+print('Gradient of Sigma[0] :\n',Sigma.grad[0])
+print('Gradient of M :\n',M.grad)
+```
+
+expected output:
+```
+Equilibrium prices: tensor([29.2456, 32.4128, 20.9177], dtype=torch.float64)
 ```
 
 ---
