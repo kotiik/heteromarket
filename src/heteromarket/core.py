@@ -344,10 +344,10 @@ class ActiveSetQPFunc(torch.autograd.Function):
         alpha_budget_low = (wl - p_dot_x) / p_dot_delta
         alpha_budget_high = (wh - p_dot_x) / p_dot_delta
         alpha_budget_low = torch.where(
-            mask | (alpha_budget_low < -eps), 1.0, alpha_budget_low
+            mask | (alpha_budget_low < -eps) | (p_dot_delta > 0.0), 1.0, alpha_budget_low
         )
         alpha_budget_high = torch.where(
-            mask | (alpha_budget_high < -eps), 1.0, alpha_budget_high
+            mask | (alpha_budget_high < -eps) | (p_dot_delta < 0.0), 1.0, alpha_budget_high
         )
         # aggregate step
         alpha = torch.minimum(alpha_to_U, alpha_to_L)
