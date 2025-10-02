@@ -1077,19 +1077,70 @@ class StockSolver(torch.nn.Module):
 
     def _find_start_point(
         self,
-        p: torch.Tensor,
-        wl: torch.Tensor,
-        wh: torch.Tensor,
-        L: torch.Tensor,
-        U: torch.Tensor,
-    ):
-        denom = bdot(p, U).clamp_min(1e-30)
-        x0 = torch.where(
-            wl.unsqueeze(-1) < 0,
-            torch.zeros_like(p),
-            U * (wl / denom).unsqueeze(-1),
-        )
-        return x0
+        p: torch.Tensor,   # (B, n) 
+        wl: torch.Tensor,  # (B,)
+        wh: torch.Tensor,  # (B,)
+        L: torch.Tensor,   # (B, n)
+        U: torch.Tensor,   # (B, n)
+    ) -> torch.Tensor:
+        eps = 1e-8
+        """
+        Return x in R^{B x n} such that:
+          L < x < U   (componentwise, up to numerical tolerance)
+          wl < p^T x < wh
+        assuming feasibility: p^T U > wl and p^T L < wh (per batch).
+
+        The construction is: x = L + alpha * (U - L), for an alpha in (0,1) that
+        also makes p^T x land strictly inside (wl, wh).
+        """
+
+        #assert p.shape == L.shape == U.shape, \
+        #    f"Shapes must match: p {p.shape}, L {L.shape}, U {U.shape}"
+
+        B, n = L.shape
+
+        # Compute p^T L and p^T U (batchwise)
+        p_dot_L = bdot(p, L)  # (B,)
+        p_dot_U = bdot(p, U)  # (B,)
+        den = p_dot_U - p_dot_L       # (B,)
+
+        # Target alpha interval coming from wl < p^T(L + alpha(U-L)) < wh
+        # a = (target - p^T L) / (p^T U - p^T L)
+        a_l = (wl - p_dot_L) / den
+        a_h = (wh - p_dot_L) / den
+
+        # Order the endpoints to get [a_min, a_max]
+        a_min = torch.minimum(a_l, a_h)
+        a_max = torch.maximum(a_l, a_h)
+
+        # Intersect with (0,1) and pull strictly inside by eps
+        lo = torch.clamp(a_min, min=0.0, max=1.0)
+        hi = torch.clamp(a_max, min=0.0, max=1.0)
+
+        # nudge away from boundaries to keep strict inequalities
+        lo = torch.clamp(lo, min=eps, max=1.0 - eps)
+        hi = torch.clamp(hi, min=eps, max=1.0 - eps)
+
+        # Handle degenerate case den ~ 0 (p^T is constant along the segment)
+        # If p^T L == p^T U and it's already strictly inside (wl, wh),
+        # pick alpha=0.5 (then only the box matters).
+        den_is_small = den.abs() <= 1e-12
+        inside_when_flat = (p_dot_L > wl) & (p_dot_L < wh) & den_is_small
+
+        # For normal cases, midpoint of the feasible alpha interval
+        alpha = 0.5 * (lo + hi)
+
+        # Where den is ~0 but feasible, choose 0.5 (and keep it away from box edges)
+        if inside_when_flat.any():
+            alpha = alpha.clone()
+            alpha[inside_when_flat] = 0.5
+            # keep margin wrt box with eps (already in (0,1) by 0.5)
+
+        # As a final guard (feasible problems should not hit this), clip to (eps,1-eps)
+        alpha = torch.clamp(alpha, min=eps, max=1.0 - eps)
+
+        # Construct x
+        return L + alpha.unsqueeze(1) * (U - L)
 
     def _convert_price(self, p: torch.Tensor, x0: torch.Tensor):
         p0 = p.repeat(self.m.shape[0], 1)  # TODO: change to m.size(0)
