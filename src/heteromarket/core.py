@@ -1301,6 +1301,68 @@ class StockSolver(torch.nn.Module):
         )
         return jv.sum(dim=0)
 
+    @staticmethod
+    def compute_cotangent(v: torch.Tensor, all_primals: tuple):
+        """
+        Given adjoint v on F(p) = solve_sum(p) ∈ R^n, return (dF/dp)^T v ∈ R^n,
+        using only saved primals (no autograd graph required).
+        """
+        # Unpack everything we need (exactly the same structure returned by compute_primals)
+        (x, p, ak, at, X,
+         Q, m1, wl, wh, L, U, p0,
+         active_comp, active_values, active_budget, budget_w,
+         H, p_eff, Lc, x_eq, y, p_dot_xeq, denom_proj, alpha) = all_primals
+
+        B, n = x.shape
+        # Upstream adjoint on each batch's x_b is v (because F = sum_b x_b)
+        grad_x = v.unsqueeze(0).expand(B, -1)
+
+        # VJP through ActiveSetQP: get adjoints wrt {m1, p0, active_values, budget_w}
+        grad_Q, grad_m1, grad_p0, grad_av, grad_bw = ActiveSetQPFunc._grad_solve(
+            Q, m1, p0, active_comp, active_values, active_budget, budget_w, grad_x
+        )
+
+        # Route adjoints to L/U and wl/wh the same way as in ActiveSetQPFunc.backward
+        grad_L = torch.where(
+            active_comp & (active_values == L), grad_av, torch.zeros_like(grad_av)
+        )
+        grad_U = torch.where(
+            active_comp & (active_values == U), grad_av, torch.zeros_like(grad_av)
+        )
+        grad_wl = torch.where(
+            active_budget & (budget_w == wl), grad_bw, torch.zeros_like(grad_bw)
+        )
+        grad_wh = torch.where(
+            active_budget & (budget_w == wh), grad_bw, torch.zeros_like(grad_bw)
+        )
+
+        # Now VJP through the algebra mapping p -> (m1, p0, L, U, wl, wh)
+
+        # p is market-wide (unbatched); p0 is repeat across batches
+        # m1 = -m + p + const  ->  dm1/dp = I  (broadcast)
+        # p0 = repeat(p)       ->  dp0/dp = repeat; sum adjoints over batch
+
+        g_p = torch.zeros_like(p)  # (n,)
+
+        # m1 contribution
+        g_p = g_p + grad_m1.sum(dim=0)
+
+        # p0 contribution
+        g_p = g_p + grad_p0.sum(dim=0)
+
+        # L = -ak / p - X  -> dL/dp_i =  ak_b / p_i^2
+        invp2 = p * p  # (n,)
+        g_p = g_p + ( (ak / invp2.unsqueeze(0)) * grad_L ).sum(dim=0)
+
+        # U =  at / p - X  -> dU/dp_i = -at_b / p_i^2
+        g_p = g_p + ( (-at / invp2.unsqueeze(0)) * grad_U ).sum(dim=0)
+
+        # wl = budget*(1-theta) - <X_b, p>, same for wh
+        # ∂wl/∂p_i = ∂wh/∂p_i = -X_{b,i}
+        g_p = g_p + ( -(grad_wl + grad_wh).unsqueeze(1) * X ).sum(dim=0)
+
+        return g_p
+    
     @torch.no_grad()
     def linearize_forward(self, p: torch.Tensor):
         # Compute primals once
@@ -1310,6 +1372,10 @@ class StockSolver(torch.nn.Module):
     def forward_jvp(self, dp: torch.Tensor):
         return StockSolver.compute_tangent(dp, self.all_primals)
 
+    @torch.no_grad()
+    def forward_vjp(self, v: torch.Tensor):
+        # (dF/dp)^T v using only saved primals
+        return StockSolver.compute_cotangent(v, self.all_primals)
 
 class StockSolverParams(NamedTuple):
     Sigma: torch.tensor
@@ -1781,10 +1847,12 @@ class BalanceFunc(GMRESSolver):
         stock_solver.linearize_forward(p_star)
 
     def forward_jvp(self, dp):
-        return stock_solver.forward_jvp(dp)
+        # TODO: rename method to match VJP
+        return stock_solver.forward_vjp(dp)
 
     def compute_residual(self, b, x):
-        return b - stock_solver.forward_jvp(x)
+        # TODO: rename method to match VJP
+        return b - stock_solver.forward_vjp(x)
 
 
 stock_solver = StockSolverGMRES(
