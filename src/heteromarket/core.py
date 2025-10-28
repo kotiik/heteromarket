@@ -600,7 +600,7 @@ class ActiveSetQPFunc(torch.autograd.Function):
         torch.Tensor,  # budget_w  (B, )
     ]:
         eps = 1e-7
-        active_comp = (x <= L + eps) | (x >= U + eps)
+        active_comp = (x <= L + eps) | (x >= U - eps)
         active_values = torch.where(
             active_comp, torch.where(x <= L + eps, L, U), 0.0
         )
