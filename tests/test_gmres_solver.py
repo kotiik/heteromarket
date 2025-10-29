@@ -766,6 +766,7 @@ class TestGMRESvsJAX(unittest.TestCase):
                 )
 
     def test_spd_full_restart_matches_exact(self):
+        np.random.seed(123)
         for dtype in (torch.float32, torch.float64):
             with self.subTest(dtype=dtype):
                 m = 10
@@ -797,6 +798,7 @@ class TestGMRESvsJAX(unittest.TestCase):
                 )
 
     def test_nonsymmetric_well_conditioned(self):
+        np.random.seed(456)
         for dtype in (torch.float32, torch.float64):
             with self.subTest(dtype=dtype):
                 m = 12
@@ -819,6 +821,7 @@ class TestGMRESvsJAX(unittest.TestCase):
                 )
 
     def test_diagonal_perfect_preconditioner(self):
+        np.random.seed(789)
         for dtype in (torch.float32, torch.float64):
             with self.subTest(dtype=dtype):
                 d = np.array([1.5, -2.0, 0.7, 3.3, -1.1], dtype=float)
