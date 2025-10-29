@@ -71,7 +71,7 @@ class SolverState(NamedTuple):
     done: torch.Tensor  # (B, ), boolean
 
 
-class SoverParameters(NamedTuple):
+class SolverParameters(NamedTuple):
     """
     Parameter bundle for a batched quadratic‑program (QP) solved by the active‑set
     solver.
@@ -239,7 +239,7 @@ class ActiveSetQPFunc(torch.autograd.Function):
     @staticmethod
     def _unpack_state_params(args: tuple):
         n_state = len(SolverState._fields)
-        return SolverState(*args[:n_state]), SoverParameters(*args[n_state:])
+        return SolverState(*args[:n_state]), SolverParameters(*args[n_state:])
 
     @staticmethod
     def _solve_under_active_int(
@@ -441,7 +441,7 @@ class ActiveSetQPFunc(torch.autograd.Function):
 
     @staticmethod
     def _update_active_sets(
-        state: SolverState, params: SoverParameters
+        state: SolverState, params: SolverParameters
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         g, g_along_p = ActiveSetQPFunc._compute_projected_gradients(
             params.Q,
@@ -980,16 +980,6 @@ class ActiveSetQPFunc(torch.autograd.Function):
         return dx
 
 
-def find_start_point(wl, wh, L, U, p):
-    denom = bdot(p, U).clamp_min(1e-30)
-    x0 = torch.where(
-        wl.unsqueeze(-1) < 0.0,
-        torch.zeros_like(p),
-        U * (wl / denom).unsqueeze(-1),
-    )
-    return x0
-
-
 # @torch.compile
 def solve_QP_problem(Q, m, c, wl, wh, L, U, p, x0):
     r = ActiveSetQPFunc.apply(Q, m, c, wl, wh, L, U, p, x0)
@@ -1182,7 +1172,7 @@ class StockSolver(torch.nn.Module):
         return self.forward(p).sum(dim=0)
 
     def solve_sum_x0(self, p: torch.Tensor, x0: torch.Tensor):
-        return self.solve_x0(p).sum(dim=0)
+        return self.solve_x0(p, x0).sum(dim=0)
 
     def compute_primals(self, p: torch.Tensor):
         B = self.m.shape[0]
@@ -1276,8 +1266,7 @@ class StockSolver(torch.nn.Module):
         dp0 = dp.unsqueeze(0).expand(B, -1)  # (B, n)
         invp2 = (p * p).unsqueeze(0)  # (1, n)
 
-        # dm1/dp = +I  (since m1 = -m + p + const)
-        dm = +dp0
+        dm = dp0  # (B, n)
 
         # dL/dp =  (ak)/p^2 * dp   ;   dU/dp = -(at)/p^2 * dp
         dL = (ak / invp2) * dp0  # (B, n)
@@ -1377,10 +1366,13 @@ class StockSolver(torch.nn.Module):
         # (dF/dp)^T v using only saved primals
         return StockSolver.compute_cotangent(v, self.all_primals)
 
+    @torch.no_grad()
+    def matvec(self, x):
+        return self.forward_jvp(x)  # J @ x        
+
 class StockSolverParams(NamedTuple):
-    Sigma: torch.tensor
-    M: torch.tensor
-    c: torch.tensor
+    Sigma: torch.Tensor
+    M: torch.Tensor
     c: torch.Tensor
     X: torch.Tensor
     budget: torch.Tensor
@@ -1389,34 +1381,34 @@ class StockSolverParams(NamedTuple):
 
 
 class StockSolverPrimals(NamedTuple):
-    Sigma: torch.tensor
-    M: torch.tensor
-    X: torch.tensor
-    wl: torch.tensor
-    wh: torch.tensor
-    L: torch.tensor
-    U: torch.tensor
-    p: torch.tensor
-    active_comp: torch.tensor
-    active_values: torch.tensor
-    active_budget: torch.tensor
-    budget_w: torch.tensor
-    H: torch.tensor
-    p_eff: torch.tensor
-    Lc: torch.tensor
-    x_eq: torch.tensor
-    y: torch.tensor
-    p_dot_xeq: torch.tensor
-    denom_proj: torch.tensor
-    alpha: torch.tensor
-    x: torch.tensor
-    ak: torch.tensor
-    at: torch.tensor
+    Sigma: torch.Tensor
+    M: torch.Tensor
+    X: torch.Tensor
+    wl: torch.Tensor
+    wh: torch.Tensor
+    L: torch.Tensor
+    U: torch.Tensor
+    p: torch.Tensor
+    active_comp: torch.Tensor
+    active_values: torch.Tensor
+    active_budget: torch.Tensor
+    budget_w: torch.Tensor
+    H: torch.Tensor
+    p_eff: torch.Tensor
+    Lc: torch.Tensor
+    x_eq: torch.Tensor
+    y: torch.Tensor
+    p_dot_xeq: torch.Tensor
+    denom_proj: torch.Tensor
+    alpha: torch.Tensor
+    x: torch.Tensor
+    ak: torch.Tensor
+    at: torch.Tensor
 
 
 class StockSolverFunc(torch.autograd.Function):
     @staticmethod
-    def forward(params: StockSolverParams, p: torch.tensor, x0, torch_tensor):
+    def forward(params: StockSolverParams, p: torch.Tensor, x0: torch.Tensor):
         pass
 
     @staticmethod
@@ -1499,7 +1491,7 @@ class GMRESSolver:
         v_k = V @ e_k  # (m,)
 
         # Arnoldi “apply, orthogonalize”
-        w = self.forward_jvp(v_k)
+        w = self.matvec(v_k)
         _, w_norm0 = GMRESSolver._safe_normalize(w)
 
         # Project against ALL columns in V (unused ones are zeros, so harmless)
@@ -1660,7 +1652,7 @@ class GMRESSolver:
 
         Parameters
         ----------
-        b : torch.tensor
+        b : torch.Tensor
             Right hand side of the linear system representing a single vector. Can be
             stored as an array or Python container of array(s) with any shape.
 
@@ -1822,7 +1814,7 @@ def newton_krylov(
 
 class StockSolverGMRES(StockSolver, GMRESSolver):
     def compute_residual(self, b, x):
-        return b - self.forward_jvp(x)
+        return b - self.matvec(x)
 
 
 class BalanceFunc(GMRESSolver):
@@ -1846,13 +1838,11 @@ class BalanceFunc(GMRESSolver):
         # (∂F/∂p) u  at the fixed point p_star
         stock_solver.linearize_forward(p_star)
 
-    def forward_jvp(self, dp):
-        # TODO: rename method to match VJP
+    def matvec(self, dp):
         return stock_solver.forward_vjp(dp)
 
     def compute_residual(self, b, x):
-        # TODO: rename method to match VJP
-        return b - stock_solver.forward_vjp(x)
+        return b - self.matvec(x)
 
 
 stock_solver = StockSolverGMRES(
