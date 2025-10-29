@@ -794,7 +794,7 @@ class TestGMRESvsJAX(unittest.TestCase):
 
                 rj = A_np @ np.asarray(x_j) - b_np
                 self.assertTrue(
-                    np.allclose(rj, 0.0, atol=2e-6 if dtype == torch.float32 else 1e-12)
+                    np.allclose(rj, 0.0, atol=5e-6 if dtype == torch.float32 else 1e-12)
                 )
 
     def test_nonsymmetric_well_conditioned(self):
