@@ -1990,45 +1990,56 @@ def find_equilibrium_prices(
     initial_approximation=None,
 ):
     """
-    Compute market-clearing (equilibrium) prices for a *batch* of heterogeneous-agent markets.
+    Compute the market-clearing equilibrium prices across multiple agents.
 
-    This function **only accepts batched inputs** (single instances are disallowed).
-    All parameters must be stacked along dimension 0 (batch). Outputs are (B, N).
-
-    Accepts PyTorch tensors or array-likes convertible to tensors and fully supports autograd,
-    enabling gradient-based calibration and inference (e.g., MCMC/NUTS).
+    This function solves for a price vector `p ∈ ℝ^N` such that the total
+    net demand across all agents equals the exogenous supply. Each agent
+    solves a mean–variance or quadratic portfolio optimization problem
+    given their own expectations, budgets, and constraints. The market
+    equilibrium is found using a Newton–Krylov iterative scheme with
+    GMRES-based linear solves.
 
     Parameters
     ----------
-    Sigma : (B, N, N)
-        Expected covariance matrices (PSD) per batch item.
-    expected_returns : (B, N)
-        Expected returns per asset per batch item.
-    commission : (B, N)
-        Per-asset commission to **buy**. Use zeros for initial portfolios.
-    holdings : (B, N)
-        Current holdings per batch item. Use zeros for initial portfolios.
-    budget : (B,)
-        Total budget per batch item.
-    short_leverage : (B,) or (B, N)
-        Per-security short cap as a fraction of `budget`. `0` ⇒ no short sales.
-    long_leverage : (B,) or (B, N)
-        Per-security long cap as a fraction of `budget`. Values < 1 ⇒ no leverage.
-    supply : (B, N)
-        Exogenous supply of each security per batch item.
-    initial_approximation : (B, N), optional
-        **Strictly positive** initial guess for prices. It should not affect the final equilibrium,
-        but a good guess can improve performance when close to equilibrium.
+    Sigma : torch.Tensor, shape (B, N, N)
+        Covariance matrices of asset returns for each of B agents.
+        Each must be positive definite.
+    expected_returns : torch.Tensor, shape (B, N)
+        Expected (mean) returns of assets for each agent.
+    commissions : torch.Tensor, shape (B,)
+        Per-agent transaction cost or commission coefficient.
+    holdings : torch.Tensor, shape (B, N)
+        Initial asset holdings of each agent.
+    budget : torch.Tensor, shape (B,)
+        Available budget for each agent.
+    kappa : torch.Tensor, shape (B,)
+        Lower leverage or risk aversion scaling parameter for each agent.
+    theta : torch.Tensor, shape (B,)
+        Upper leverage or risk aversion scaling parameter for each agent.
+    supply : torch.Tensor, shape (N,)
+        Aggregate market supply of each asset.
+        The equilibrium ensures total demand equals this supply.
+    initial_approximation : torch.Tensor, shape (N,), optional
+        Initial guess for the equilibrium price vector. If not provided,
+        a positive vector of ones is used.
 
     Returns
     -------
-    equilibrium_prices : (B, N) torch.Tensor
-        Market-clearing price vectors (aggregate demand ≈ supply per batch).
+    prices : torch.Tensor, shape (N,)
+        Market-clearing equilibrium price vector such that
+        the total excess demand across agents is (approximately) zero.
 
     Notes
     -----
-    - **Batched only**: all inputs (including `initial_approximation`, if provided) must be batched.
-    - Fully differentiable; non-tensors are converted to tensors.
+    - The computation uses a differentiable custom autograd function.
+      Gradients with respect to all differentiable inputs
+      (`Sigma`, `expected_returns`, `commissions`, `holdings`,
+      `budget`, `kappa`, `theta`, and `supply`) are supported.
+    - When used inside a larger computational graph, backpropagation
+      solves an adjoint linear system using GMRES to obtain
+      ∂p/∂inputs efficiently.
+    - Input tensors are expected to be `float64` for best numerical
+      accuracy, though `float32` is also supported.
 
     Examples
     --------
