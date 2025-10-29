@@ -1276,8 +1276,8 @@ class StockSolver(torch.nn.Module):
         dp0 = dp.unsqueeze(0).expand(B, -1)  # (B, n)
         invp2 = (p * p).unsqueeze(0)  # (1, n)
 
-        # dm1/dp = -I  (broadcast over batches)
-        dm = -dp0  # (B, n)
+        # dm1/dp = +I  (since m1 = -m + p + const)
+        dm = +dp0
 
         # dL/dp =  (ak)/p^2 * dp   ;   dU/dp = -(at)/p^2 * dp
         dL = (ak / invp2) * dp0  # (B, n)
