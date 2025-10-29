@@ -41,7 +41,7 @@ class SimpleFunc:
         return x
         
     def matvec(self, x):
-        return self.forward_jvp(self, x)
+        return self.forward_jvp(x)
     
     def compute_residual(self, b, x):
         return b - x
@@ -52,7 +52,7 @@ class LinearFunc(SimpleFunc):
         return self.M @ (self.A @ x)
     
     def matvec(self, x):
-        return self.forward_jvp(self, x)
+        return self.forward_jvp(x)
         
     def compute_residual(self, b, x):
         return self.M @ (b - self.A @ x)
