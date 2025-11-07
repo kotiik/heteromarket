@@ -479,6 +479,75 @@ class TestStockSolverFunc(unittest.TestCase):
             f"|lhs-rhs|={(lhs-rhs).abs().item():.3e}",
         )
 
+def _convert_price(
+    Q: torch.Tensor,
+    m: torch.Tensor,
+    budget: torch.Tensor,
+    kappa: torch.Tensor,
+    theta: torch.Tensor,
+    p: torch.Tensor,
+):
+    p0 = p.repeat(m.shape[0], 1)
+    m1 = -m + p0 + 2.0
+    L = -1.0 / p0 * ((budget * kappa).unsqueeze(0))
+    U = 1.0 / p0 * ((budget * theta).unsqueeze(0))
+    # because of sign, theta and kappa are swapped, this is not an error!
+    # this is cash restriction !
+    # replace self.theta, self.kappa to change cash budget multiplier
+    wl = budget * (1.0 - theta)
+    wh = budget * (1.0 + kappa)
+    # validate starting point and update if needed
+    return p0, m1, wl, wh, L, U
+
+
+def stock_solver_func(
+    Q: torch.Tensor,  # (B, n, n)
+    M: torch.Tensor,  # (B, n)
+    budget: torch.Tensor,  # (B, )
+    kappa: torch.Tensor,  # (B, )
+    theta: torch.Tensor,  # (B, )
+    p: torch.Tensor,  # (n)
+    x0: torch.Tensor,  # (B, n)
+) -> Tuple[Tensor, ...] | Tensor:
+    return StockSolverFunc.apply(
+        Q,
+        M,
+        torch.zeros_like(kappa),
+        torch.zeros_like(M),
+        budget,
+        kappa,
+        theta,
+        p,
+        x0,
+    )
+
+
+def stock_solver_func_ref(
+    Q: torch.Tensor,  # (B, n, n)
+    M: torch.Tensor,  # (B, n)
+    budget: torch.Tensor,  # (B, )
+    kappa: torch.Tensor,  # (B, )
+    theta: torch.Tensor,  # (B, )
+    p: torch.Tensor,  # (n)
+    x0: torch.Tensor,  # (B, n)
+) -> Tuple[Tensor, ...] | Tensor:
+    p0, m1, wl, wh, L, U, x0 = StockSolverFunc._convert_price(
+        Q,
+        M,
+        torch.zeros_like(kappa),
+        torch.zeros_like(M),
+        budget,
+        kappa,
+        theta,
+        p,
+        torch.zeros_like(M),
+    )
+    # x0 = find_start_point(wl, wh, L, U, p0)
+    return ActiveSetQPFunc.apply(
+        Q, m1, torch.zeros_like(kappa), wl, wh, L, U, p0, x0
+    )[0]
+
+
 cov_list = [
     np.array(
         [
