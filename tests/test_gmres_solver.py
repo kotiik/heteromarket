@@ -842,3 +842,6 @@ class TestGMRESvsJAX(unittest.TestCase):
                 self.assertAllCloseTorch(
                     torch.linalg.vector_norm(rt), torch.tensor(0.0, dtype=dtype), dtype
                 )
+
+if __name__ == "__main__":
+    unittest.main()
