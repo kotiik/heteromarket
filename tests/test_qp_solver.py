@@ -2520,3 +2520,5 @@ class TestQPSoverWithCVXPY(unittest.TestCase):
             msg=f"Number of failed Sigma tests {nfailedSigma} >=15%",
         )
 
+if __name__ == "__main__":
+    unittest.main()
