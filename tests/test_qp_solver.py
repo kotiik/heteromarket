@@ -7,6 +7,7 @@ from scipy import stats
 import cvxpy as cp
 import numpy as np
 from sklearn.metrics import r2_score
+import math
 import random
 
 _core = importlib.import_module("heteromarket.core")
