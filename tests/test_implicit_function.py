@@ -131,3 +131,5 @@ class TestImplicitFunction(unittest.TestCase):
             # New call signature: .apply(y, *inputs)
             G.apply(y, x1_init, x2)
 
+if __name__ == "__main__":
+    unittest.main()
