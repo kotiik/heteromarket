@@ -5,6 +5,8 @@ import numpy as np
 from scipy import stats
 from torch.autograd.functional import jvp
 import itertools
+from typing import Any, Tuple
+from torch import Tensor
 
 _core = importlib.import_module("heteromarket.core")
 StockSolverFunc = _core.StockSolverFunc
