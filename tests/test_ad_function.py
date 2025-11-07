@@ -1,5 +1,6 @@
 import importlib
 import torch
+from torch import Tensor
 import unittest
 
 _core = importlib.import_module("heteromarket.core")
