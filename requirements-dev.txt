@@ -4,7 +4,6 @@ jax
 cvxpy
 numpy
 scikit-learn
-itertools
 scipy
 coverage        # test coverage
 ruff            # lint
