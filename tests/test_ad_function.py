@@ -3,7 +3,7 @@ import torch
 import unittest
 
 _core = importlib.import_module("heteromarket.core")
-GMRESSolver = _core.GMRESSolver
+ExplicitADFunction = _core.ExplicitADFunction
 bdot = _core.bdot
 
 # ---------------------------------------------------------------------
