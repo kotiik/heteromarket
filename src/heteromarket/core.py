@@ -1,12 +1,309 @@
 import torch
-import torch.nn as nn
-from torch.autograd import grad
-import torch.nn.functional as functional
 from torch import ops
+import torch.nn.functional as functional
+from typing import Any, Tuple, Sequence, NamedTuple, Callable, Tuple
 
-import numpy as np
-import math
-from typing import NamedTuple, Callable, Tuple
+
+def _as_tuple(x):
+    return x if isinstance(x, tuple) else (x,)
+
+
+class ExplicitADFunction(torch.autograd.Function):
+    """
+    Base class for stateless, formula-based autograd with primals-only-once,
+    modern-style setup_context, optional non-differentiable outputs, and
+    needs_input_grad-aware backward.
+
+    Subclass MUST implement:
+      - compute(*inputs) -> outputs
+      - compute_primals(*inputs, outputs) -> saved
+      - vjp_from_primals(saved, *cotangents, needs_input_grad=None) -> grads_per_input
+      - jvp_from_primals(saved, *tangents) -> out_tangents
+
+    Optional in subclass:
+      - non_differentiable_output_indices: tuple[int, ...] (class attribute)
+    """
+
+    # Set in subclasses as needed, e.g., (1, 3)
+    non_differentiable_output_indices: Tuple[int, ...] = ()
+
+    # --------- hooks subclasses must provide ----------
+    @staticmethod
+    def compute(*inputs: torch.Tensor) -> Tuple[torch.Tensor, ...] | torch.Tensor:
+        """
+        Compute the forward outputs of the function from the given inputs.
+
+        This method defines the mathematical transformation implemented by the
+        custom operation. It is called once during the forward pass (both in
+        eager execution and compiled graphs) and must return the function’s
+        outputs as Tensors.
+
+        The computation performed here is pure and stateless: given identical
+        inputs, it must always produce identical outputs. No autograd context is
+        active during this call, and the returned tensors form the “outputs” of
+        the forward pass. Any additional intermediate data required to compute
+        derivatives should instead be prepared in :meth:`compute_primals`, which
+        is executed later inside :meth:`setup_context`.
+
+        Parameters
+        ----------
+        *inputs : Tensor
+            The input tensors of the operation. Each may or may not require
+            gradients. These inputs correspond exactly to the arguments passed
+            to :meth:`apply`.
+
+        Returns
+        -------
+        outputs : Tensor or tuple[Tensor, ...]
+            The result of applying the function to the given inputs. This can be
+            a single Tensor or a tuple of Tensors. The structure and shapes must
+            match what is expected by subsequent consumers of the operation.
+
+        Notes
+        -----
+        - This method must **not** perform any in-place modifications on its
+          inputs.
+        - The returned tensors should be free of autograd history; any
+          intermediate values needed for differentiation should be recomputed or
+          cached in :meth:`compute_primals`.
+        - Subclasses should aim for numerical stability and efficiency in this
+          computation, as it is executed during both training and inference.
+        """
+        raise NotImplementedError
+
+    @staticmethod
+    def compute_primals(
+        *inputs: torch.Tensor, outputs: Tuple[torch.Tensor, ...] | torch.Tensor
+    ) -> Any:
+        """
+        Prepare and return any auxiliary data (“primals”) required to compute
+        derivatives efficiently.
+
+        This method is executed once inside :meth:`setup_context`, after the
+        forward outputs have already been computed by :meth:`compute`. Its sole
+        purpose is to precompute and cache any intermediate quantities needed
+        later by :meth:`vjp_from_primals` or :meth:`jvp_from_primals`, so that
+        these derivatives can be evaluated without recomputing the entire
+        forward function.
+
+        Implementations should return an arbitrary Python object (typically a
+        tuple or dictionary of tensors, scalars, or constants) that will be
+        stored on the autograd context as ``ctx._saved``. This data must not
+        depend on autograd history or contain tensors that keep the computation
+        graph alive.
+
+        Parameters
+        ----------
+        *inputs : Tensor
+            The same input tensors originally passed to :meth:`compute`. These
+            are provided so that intermediate quantities depending on the inputs
+            can be precomputed.
+
+        outputs : Tensor or tuple[Tensor, ...]
+            The outputs returned by :meth:`compute`. This allows derivatives to
+            be expressed in terms of both inputs and outputs if desired.
+
+        Returns
+        -------
+        saved : Any
+            Arbitrary auxiliary data required for derivative computation.
+            Common examples include reusable partial results, constants,
+            or values of intermediate expressions. The returned object is passed
+            verbatim to both :meth:`vjp_from_primals` and :meth:`jvp_from_primals`
+            during backward and forward-mode differentiation, respectively.
+
+        Notes
+        -----
+        - This method should be **pure** and side-effect-free.
+        - It must not perform in-place operations on its inputs or outputs.
+        - The returned data should be as lightweight as possible — avoid storing
+          entire input tensors if only small derived quantities are needed.
+        - This method is called exactly once per forward pass.
+        """
+        raise NotImplementedError
+
+    @staticmethod
+    def vjp_from_primals(
+        saved: Any,
+        *cotangents: torch.Tensor,
+        needs_input_grad: Sequence[bool] | None = None,
+    ) -> Tuple[torch.Tensor | None, ...]:
+        """
+        Compute the vector–Jacobian product (VJP) of the function with respect to
+        its inputs, given precomputed primal data.
+
+        This method implements the **reverse-mode derivative** of the function,
+        i.e. the mapping:
+            (cotangents) ↦ (gradients w.r.t. inputs)
+
+        It is invoked during :meth:`backward` and in functional VJP evaluations.
+        Unlike `compute_primals`, it must not build any autograd graph — the
+        returned gradients must be computed manually using closed-form formulas.
+
+        Parameters
+        ----------
+        saved : Any
+            The auxiliary data returned by :meth:`compute_primals`. Typically
+            includes any intermediate tensors or constants needed to evaluate
+            partial derivatives efficiently. It must not reference autograd
+            history (no tensors with `grad_fn` attached).
+
+        *cotangents : Tensor
+            One tensor per differentiable output of the function, representing
+            the adjoint (or "upstream gradient") associated with that output.
+            Each has the same shape as its corresponding output tensor.
+
+        needs_input_grad : Sequence[bool] or None, optional
+            A boolean mask indicating which inputs actually require gradients,
+            as provided by `ctx.needs_input_grad` during the backward pass.
+            Implementations should use this to skip unnecessary computation and
+            may return `None` for inputs that do not require gradients. If
+            `None`, gradients for all inputs are assumed to be needed.
+
+        Returns
+        -------
+        gradients : tuple[Tensor or None, ...]
+            One element per input tensor to the forward function. Each element
+            is either:
+              - a `Tensor` containing the gradient of the scalar objective
+                with respect to that input, or
+              - `None`, if no gradient is required for that input.
+
+        Notes
+        -----
+        - The shapes of the returned gradients must match the corresponding
+          input tensors.
+        - This method should be **pure** (no side effects) and must not rely on
+          any autograd computation.
+        - For non-differentiable outputs (listed in
+          `non_differentiable_output_indices`), the corresponding cotangents may
+          be ignored.
+        - To avoid unnecessary allocations, implementations may compute
+          gradients in-place on temporary buffers, but must not modify
+          user-provided inputs or saved data.
+        """
+        raise NotImplementedError
+
+    @staticmethod
+    def jvp_from_primals(
+        saved: Any, *tangents: torch.Tensor | None
+    ) -> Tuple[torch.Tensor, ...]:
+        """
+        Compute the Jacobian–vector product (JVP) of the function with respect to
+        its inputs, given precomputed primal data.
+
+        This method implements the **forward-mode derivative** of the function,
+        i.e. the mapping:
+            (tangents) ↦ (output tangents)
+
+        It is invoked during forward-mode automatic differentiation (e.g.
+        :meth:`jvp`) and in functional JVP evaluations. The implementation must
+        use explicit derivative formulas rather than relying on PyTorch’s
+        autograd tracing.
+
+        Parameters
+        ----------
+        saved : Any
+            The auxiliary data returned by :meth:`compute_primals`. It contains
+            any intermediate tensors or constants needed to compute derivatives.
+            This data must not depend on autograd state or contain tensors with
+            active computation graphs.
+
+        *tangents : Tensor or None
+            One tangent vector per input tensor. Each tangent represents the
+            infinitesimal change in that input. If a tangent is `None`, it should
+            be treated as a zero tensor of the same shape as the corresponding
+            input. Implementations are responsible for substituting zeros when
+            needed.
+
+        Returns
+        -------
+        output_tangents : tuple[Tensor, ...]
+            The tangent vectors corresponding to the function’s outputs. Each
+            element must have the same shape as the respective output tensor from
+            :meth:`compute_primals`. Non-differentiable outputs (listed in
+            `non_differentiable_output_indices`) should yield zero tangents.
+
+        Notes
+        -----
+        - This method provides **forward-mode differentiation**, complementing
+          the reverse-mode derivative defined in :meth:`vjp_from_primals`.
+        - Implementations must not rely on PyTorch’s autograd engine.
+        - Tangent computation should be numerically stable and efficient;
+          precomputing reusable quantities in :meth:`compute_primals` is
+          encouraged.
+        - The function should be **pure**: no in-place modification of inputs or
+          saved data is allowed.
+        - All output tangents must be returned as `Tensor` objects; use zeros for
+          non-differentiable or unused outputs rather than returning `None`.
+        """
+        raise NotImplementedError
+
+    # --------------- autograd plumbing ----------------
+    @classmethod
+    def forward(cls, *inputs: torch.Tensor):
+        return cls.compute(*inputs)
+
+    @classmethod
+    def setup_context(cls, ctx, inputs, output):
+        # 1) Mark non-differentiable outputs (if any)
+        nd_idx = getattr(cls, "non_differentiable_output_indices", ())
+        if nd_idx:
+            outs = _as_tuple(output)
+            to_mark = [outs[i] for i in nd_idx if i < len(outs)]
+            if to_mark:
+                ctx.mark_non_differentiable(*to_mark)
+
+        # 2) Compute and stash primals/intermediates once
+        saved = cls.compute_primals(*inputs, outputs=output)
+        ctx._saved = saved
+
+    @classmethod
+    def backward(cls, ctx, *cotangents: torch.Tensor):
+        needs = ctx.needs_input_grad  # tuple[bool] matching forward inputs
+        grads = list(
+            cls.vjp_from_primals(
+                ctx._saved, *cotangents, needs_input_grad=needs
+            )
+        )
+        # Ensure None for inputs that don't need grad (safety + perf)
+        for i, need in enumerate(needs):
+            if not need:
+                grads[i] = None
+        return tuple(grads)
+
+    @classmethod
+    def jvp(cls, ctx, *tangents: torch.Tensor | None):
+        # PyTorch may pass None tangents; subclass should treat them as zeros
+        return cls.jvp_from_primals(ctx._saved, *tangents)
+
+    # --------------- functional helpers ----------------
+    @classmethod
+    def fwd(cls, *inputs: torch.Tensor):
+        with torch.no_grad():
+            outputs, _ = cls.compute_primals(*inputs)
+        return outputs
+
+    @classmethod
+    def primals(cls, *inputs: torch.Tensor):
+        outputs, saved = cls.compute_primals(*inputs)
+        return outputs, saved
+
+    @classmethod
+    def vjp_with_primals(
+        cls, saved: Any, *cotangents: torch.Tensor, needs_input_grad=None
+    ):
+        return cls.vjp_from_primals(
+            saved, *cotangents, needs_input_grad=needs_input_grad
+        )
+
+    @classmethod
+    def jvp_with_primals(cls, saved: Any, *tangents: torch.Tensor):
+        return cls.jvp_from_primals(saved, *tangents)
+
+    @classmethod
+    def apply(cls, *args, **kwargs):  # type: ignore[override]
+        return super(ExplicitADFunction, cls).apply(*args, **kwargs)
 
 
 class SolverState(NamedTuple):
@@ -161,6 +458,32 @@ class SolverPrimals(NamedTuple):
     alpha: torch.Tensor
 
 
+class SolverPrimalsComplete(NamedTuple):
+    """
+    Complete set of values for backpropogation of gradient
+    """
+
+    Q: torch.Tensor  # (B, n, n)
+    m: torch.Tensor  # (B, n)
+    wl: torch.Tensor  # (B, )
+    wh: torch.Tensor  # (B, )
+    L: torch.Tensor  # (B, n)
+    U: torch.Tensor  # (B, n)
+    p: torch.Tensor  # (B, n)
+    active_comp: torch.Tensor  # (B, n), boolean
+    active_values: torch.Tensor  # (B, n)
+    active_budget: torch.Tensor  # (B, ), boolean
+    budget_w: torch.Tensor  # (B, )
+    H: torch.Tensor  # (B, n, n)
+    p_eff: torch.Tensor
+    Lc: torch.Tensor
+    x_eq: torch.Tensor
+    y: torch.Tensor
+    p_dot_xeq: torch.Tensor
+    denom_proj: torch.Tensor
+    alpha: torch.Tensor
+
+
 # ----------------------------------------------------------------------
 # Batched dot product
 # ----------------------------------------------------------------------
@@ -235,7 +558,9 @@ def bmv(M: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     return (M @ x.unsqueeze(-1)).squeeze(-1)
 
 
-class ActiveSetQPFunc(torch.autograd.Function):
+class ActiveSetQPFunc(ExplicitADFunction):
+    non_differentiable_output_indices = (1, 2, 3, 4)
+
     @staticmethod
     def _unpack_state_params(args: tuple):
         n_state = len(SolverState._fields)
@@ -344,10 +669,14 @@ class ActiveSetQPFunc(torch.autograd.Function):
         alpha_budget_low = (wl - p_dot_x) / p_dot_delta
         alpha_budget_high = (wh - p_dot_x) / p_dot_delta
         alpha_budget_low = torch.where(
-            mask | (alpha_budget_low < -eps) | (p_dot_delta > 0.0), 1.0, alpha_budget_low
+            mask | (alpha_budget_low < -eps) | (p_dot_delta > 0.0),
+            1.0,
+            alpha_budget_low,
         )
         alpha_budget_high = torch.where(
-            mask | (alpha_budget_high < -eps) | (p_dot_delta < 0.0), 1.0, alpha_budget_high
+            mask | (alpha_budget_high < -eps) | (p_dot_delta < 0.0),
+            1.0,
+            alpha_budget_high,
         )
         # aggregate step
         alpha = torch.minimum(alpha_to_U, alpha_to_L)
@@ -365,7 +694,7 @@ class ActiveSetQPFunc(torch.autograd.Function):
         p: torch.Tensor,  # (B, n)
         active_comp: torch.Tensor,  # (B, n)
         active_budget: torch.Tensor,  # (B, n)
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:  # g: (B, n)  # g_along_p: (B,)
         """
         Compute gradient g (projected onto the budget tangent if a budget
         constraint is active) and its component along the budget normal.
@@ -405,12 +734,14 @@ class ActiveSetQPFunc(torch.autograd.Function):
         active_comp: torch.Tensor,  # (B, n)
         active_budget: torch.Tensor,  # (B,)
     ) -> tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+        torch.Tensor,  # low_keep (B, n)
+        torch.Tensor,  # high_keep (B, n)
+        torch.Tensor,  # zero_keep (B, n)
+        torch.Tensor,  # budg_low_keep (B, )
+        torch.Tensor,  # budg_high_keep  (B, )
     ]:
         """
         Update active-set masks based on KKT sign rules at the new point.
-        Returns:
-            active_low, active_high, active_zero, active_budg_low, active_budg_high
         """
         eps = 1e-7
 
@@ -442,7 +773,12 @@ class ActiveSetQPFunc(torch.autograd.Function):
     @staticmethod
     def _update_active_sets(
         state: SolverState, params: SolverParameters
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,  # active_comp (B, n)
+        torch.Tensor,  # active_values (B, n)
+        torch.Tensor,  # active_budget (B, )
+        torch.Tensor,  # budget_w  (B, )
+    ]:
         g, g_along_p = ActiveSetQPFunc._compute_projected_gradients(
             params.Q,
             params.m,
@@ -530,13 +866,13 @@ class ActiveSetQPFunc(torch.autograd.Function):
 
     # takes SolverState and SolverParams in unpacked form
     @staticmethod
-    def exit_cond(*args):
+    def _exit_cond(*args):
         state, _ = ActiveSetQPFunc._unpack_state_params(args)
         return (~state.done).any()
 
     # takes SolverState and SolverParams in unpacked form
     @staticmethod
-    def main_loop(*args):
+    def _main_loop(*args):
         state, params = ActiveSetQPFunc._unpack_state_params(args)
         tol = 1e-6
         (
@@ -618,8 +954,9 @@ class ActiveSetQPFunc(torch.autograd.Function):
         )
         return x, active_comp, active_values, active_budget, budget_w
 
+    # ------------ Interface methods ------------------
     @staticmethod
-    def forward(
+    def compute(
         Q: torch.Tensor,  # (B, n, n)
         m: torch.Tensor,  # (B, n)
         c: torch.Tensor,  # (B, )
@@ -645,19 +982,10 @@ class ActiveSetQPFunc(torch.autograd.Function):
             budget_w,
             _,
         ) = ops.higher_order.while_loop(
-            ActiveSetQPFunc.exit_cond,
-            ActiveSetQPFunc.main_loop,
+            ActiveSetQPFunc._exit_cond,
+            ActiveSetQPFunc._main_loop,
             tuple(state),
-            (
-                Q,
-                m,
-                c,
-                wl,
-                wh,
-                L,
-                U,
-                p,
-            ),
+            (Q, m, c, wl, wh, L, U, p),
         )
 
         # Mark infeasible batches
@@ -673,17 +1001,16 @@ class ActiveSetQPFunc(torch.autograd.Function):
         return ActiveSetQPFunc._finalize_active_sets(x, p, wl, wh, L, U)
 
     @staticmethod
-    def setup_context(ctx, inputs: tuple, output: tuple):
+    def compute_primals(
+        *inputs: torch.Tensor, outputs: Tuple[torch.Tensor, ...] | torch.Tensor
+    ) -> SolverPrimalsComplete:
         Q, m, _, wl, wh, L, U, p, _ = inputs
-        x, active_comp, active_values, active_budget, budget_w = output
+        _, active_comp, active_values, active_budget, budget_w = outputs
 
-        # Non-diff aux outputs:
-        ctx.mark_non_differentiable(
-            active_comp, active_values, active_budget, budget_w
+        primals = ActiveSetQPFunc._solve_under_active_int(
+            Q, m, p, active_comp, active_values, active_budget, budget_w
         )
-
-        # stash as attributes for JVP path (functorch may not populate saved_tensors)
-        ctx.saved_for_jvp = (
+        return SolverPrimalsComplete(
             Q,
             m,
             wl,
@@ -695,22 +1022,44 @@ class ActiveSetQPFunc(torch.autograd.Function):
             active_values,
             active_budget,
             budget_w,
+            primals.H,
+            primals.p_eff,
+            primals.Lc,
+            primals.x_eq.clone(),  # DO I NEED TO CLONE THEM?
+            primals.y.clone(),
+            primals.p_dot_xeq,
+            primals.denom_proj,
+            primals.alpha,
         )
 
-        # Save for backward (VJP path)
-        ctx.save_for_backward(*ctx.saved_for_jvp)
-
     @staticmethod
-    def _grad_solve(
-        Q: torch.Tensor,  # (B, n, n)
-        m: torch.Tensor,  # (B, n)
-        p: torch.Tensor,  # (B, n)
-        active_comp: torch.Tensor,  # (B, n), bool
-        active_values: torch.Tensor,  # (B, n)
-        active_budget: torch.Tensor,  # (B,) or (B, n) boolean
-        budget_w: torch.Tensor,  # (B,)
-        grad_x: torch.Tensor,  # (B, n) upstream gradient
-    ):
+    def vjp_from_primals(
+        saved: SolverPrimalsComplete,
+        *cotangents: torch.Tensor,
+        needs_input_grad: Sequence[bool] | None = None,
+    ) -> Tuple[torch.Tensor | None, ...]:
+        (
+            Q,
+            m,
+            wl,
+            wh,
+            L,
+            U,
+            p,
+            active_comp,
+            active_values,
+            active_budget,
+            budget_w,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        ) = saved
+        grad_x, _, _, _, _ = cotangents
         (
             H,
             p_eff,
@@ -799,37 +1148,9 @@ class ActiveSetQPFunc(torch.autograd.Function):
         )
 
         grad_H = grad_H_from_v1 + grad_H_from_Q1
-
         # H = 2Q
         grad_Q = 2.0 * grad_H
 
-        return grad_Q, grad_m, grad_p, grad_av, grad_bw
-
-    @staticmethod
-    def backward(ctx, grad_x, *_unused_grads):
-        (
-            Q,
-            m,
-            wl,
-            wh,
-            L,
-            U,
-            p,
-            active_comp,
-            active_values,
-            active_budget,
-            budget_w,
-        ) = ctx.saved_tensors
-        grad_Q, grad_m, grad_p, grad_av, grad_bw = ActiveSetQPFunc._grad_solve(
-            Q,
-            m,
-            p,
-            active_comp,
-            active_values,
-            active_budget,
-            budget_w,
-            grad_x,
-        )
         grad_L = torch.where(
             active_comp & (active_values == L),
             grad_av,
@@ -851,63 +1172,21 @@ class ActiveSetQPFunc(torch.autograd.Function):
             torch.zeros_like(grad_bw),
         )
         return (
-            grad_Q if ctx.needs_input_grad[0] else None,
-            grad_m if ctx.needs_input_grad[1] else None,
+            grad_Q,
+            grad_m,
             None,
-            grad_wl if ctx.needs_input_grad[3] else None,
-            grad_wh if ctx.needs_input_grad[4] else None,
-            grad_L if ctx.needs_input_grad[5] else None,
-            grad_U if ctx.needs_input_grad[6] else None,
-            grad_p if ctx.needs_input_grad[7] else None,
-            None,
-        )
-
-    @torch.no_grad()
-    @staticmethod
-    def jvp(ctx, dQ, dm, dc, dwl, dwh, dL, dU, dp, dx0):
-        saved_primals = ActiveSetQPFunc._process_primals(ctx.saved_for_jvp)
-        return (
-            ActiveSetQPFunc._jvp_int(
-                saved_primals, dQ, dm, dc, dwl, dwh, dL, dU, dp, dx0
-            ),
-            None,
-            None,
-            None,
+            grad_wl,
+            grad_wh,
+            grad_L,
+            grad_U,
+            grad_p,
             None,
         )
 
     @staticmethod
-    def _process_primals(saved_vars):
-        (
-            Q,
-            m,
-            wl,
-            wh,
-            L,
-            U,
-            p,
-            active_comp,
-            active_values,
-            active_budget,
-            budget_w,
-        ) = saved_vars
-        primals = ActiveSetQPFunc._solve_under_active_int(
-            Q, m, p, active_comp, active_values, active_budget, budget_w
-        )
-        return (
-            *saved_vars,
-            primals.H,
-            primals.p_eff,
-            primals.Lc,
-            primals.x_eq.clone(),  # DO I NEED TO CLONE THEM?
-            primals.y.clone(),
-            primals.p_dot_xeq,
-            primals.denom_proj,
-            primals.alpha,
-        )
-
-    @staticmethod
-    def _jvp_int(saved_primals, dQ, dm, dc, dwl, dwh, dL, dU, dp, dx0):
+    def jvp_from_primals(
+        saved: SolverPrimalsComplete, *tangents: torch.Tensor | None
+    ) -> Tuple[torch.Tensor, ...]:
         # saved and processed primals
         (
             Q,
@@ -929,7 +1208,8 @@ class ActiveSetQPFunc(torch.autograd.Function):
             p_dot_xeq,
             denom_proj,
             alpha,
-        ) = saved_primals
+        ) = saved
+        dQ, dm, dc, dwl, dwh, dL, dU, dp, dx0 = tangents
         # compute dav = d_active_values and dbw = d_budget_w
         # from dwl, dwh, dL, dU
         dav = torch.where(
@@ -977,25 +1257,33 @@ class ActiveSetQPFunc(torch.autograd.Function):
         )
         # Final JVP: dx = dx_eq + dalpha * y + alpha * dy
         dx = dx_eq + dalpha.unsqueeze(-1) * y + alpha.unsqueeze(-1) * dy
-        return dx
+        return (dx, None, None, None, None)
 
 
-# @torch.compile
-def solve_QP_problem(Q, m, c, wl, wh, L, U, p, x0):
-    r = ActiveSetQPFunc.apply(Q, m, c, wl, wh, L, U, p, x0)
-    return r[0]
+class StockSolverPrimals(NamedTuple):
+    x: torch.Tensor
+    p: torch.Tensor
+    budget: torch.Tensor
+    kappa: torch.Tensor
+    theta: torch.Tensor
+    ak: torch.Tensor
+    at: torch.Tensor
+    X: torch.Tensor
+    Q: torch.Tensor
 
 
-# Call autograd.Function in eager mode
-def solve_QP_problem2(Q, m, c, wl, wh, L, U, p, x0):
-    return ActiveSetQPFunc.apply(Q, m, c, wl, wh, L, U, p, x0)[0]
+# TODO: Q and (maybe) p can be taken form QP solver primals
 
 
-def objective(Q: torch.Tensor, m: torch.Tensor, x: torch.Tensor):
-    return bquad(Q, x) + bdot(m, x)
+class StockSolverFunc(ExplicitADFunction):
+    non_differentiable_output_indices = (2, 8)
 
-
-class StockSolver(torch.nn.Module):
+    @staticmethod
+    def _unpack_primals(args: tuple):
+        n_state = len(StockSolverPrimals._fields)
+        return StockSolverPrimals(*args[:n_state]), SolverPrimalsComplete(
+            *args[n_state:]
+        )
 
     @staticmethod
     def _expect(name, t, shape):
@@ -1004,8 +1292,8 @@ class StockSolver(torch.nn.Module):
                 f"{name} must have shape {shape}; got {tuple(t.shape)}"
             )
 
-    def __init__(
-        self,
+    @staticmethod
+    def _validate(
         Q: torch.Tensor,
         m: torch.Tensor,
         c: torch.Tensor,
@@ -1014,50 +1302,22 @@ class StockSolver(torch.nn.Module):
         kappa: torch.Tensor,
         theta: torch.Tensor,
     ):
-        super().__init__()
-        self.update(Q, m, c, X, budget, kappa, theta)
-
-    def update(
-        self,
-        Q: torch.Tensor,
-        m: torch.Tensor,
-        c: torch.Tensor,
-        X: torch.Tensor,
-        budget: torch.Tensor,
-        kappa: torch.Tensor,
-        theta: torch.Tensor,
-    ):
-        self.register_buffer("Q", Q)
-        if self.Q.ndim != 3:
+        if Q.ndim != 3:
             raise ValueError(
-                f"Q must have shape (B, n, n); got {tuple(self.Q.shape)}"
+                f"Q must have shape (B, n, n); got {tuple(Q.shape)}"
             )
-        B, n, n2 = self.Q.shape
+        B, n, n2 = Q.shape
         if n != n2:
             raise ValueError(
                 f"Q must be square on its last two dims; got {n}x{n2}"
             )
-        tensors = {
-            "m": m,
-            "c": c,
-            "X": X,
-            "budget": budget,
-            "kappa": kappa,
-            "theta": theta,
-        }
-        for name, t in tensors.items():
-            self.register_buffer(name, t)
-
-        self.register_buffer("B", torch.tensor(B))
-        self.register_buffer("n", torch.tensor(n))
-
         # Validate input
-        self._expect("m", m, (B, n))
-        self._expect("X", X, (B, n))
-        self._expect("c", c, (B,))
-        self._expect("budget", budget, (self.B,))
-        self._expect("kappa", kappa, (B,))
-        self._expect("theta", theta, (B,))
+        StockSolverFunc._expect("m", m, (B, n))
+        StockSolverFunc._expect("X", X, (B, n))
+        StockSolverFunc._expect("c", c, (B,))
+        StockSolverFunc._expect("budget", budget, (B,))
+        StockSolverFunc._expect("kappa", kappa, (B,))
+        StockSolverFunc._expect("theta", theta, (B,))
         if not torch.all(budget > 0):
             raise ValueError("Each element of budget must be > 0")
         if not torch.all(kappa >= 0):
@@ -1065,13 +1325,13 @@ class StockSolver(torch.nn.Module):
         if not torch.all(theta > 0):
             raise ValueError("Each element of theta must be > 0")
 
+    @staticmethod
     def _find_start_point(
-        self,
-        p: torch.Tensor,   # (B, n) 
+        p: torch.Tensor,  # (B, n)
         wl: torch.Tensor,  # (B,)
         wh: torch.Tensor,  # (B,)
-        L: torch.Tensor,   # (B, n)
-        U: torch.Tensor,   # (B, n)
+        L: torch.Tensor,  # (B, n)
+        U: torch.Tensor,  # (B, n)
     ) -> torch.Tensor:
         eps = 1e-8
         """
@@ -1084,7 +1344,7 @@ class StockSolver(torch.nn.Module):
         also makes p^T x land strictly inside (wl, wh).
         """
 
-        #assert p.shape == L.shape == U.shape, \
+        # assert p.shape == L.shape == U.shape, \
         #    f"Shapes must match: p {p.shape}, L {L.shape}, U {U.shape}"
 
         B, n = L.shape
@@ -1092,7 +1352,7 @@ class StockSolver(torch.nn.Module):
         # Compute p^T L and p^T U (batchwise)
         p_dot_L = bdot(p, L)  # (B,)
         p_dot_U = bdot(p, U)  # (B,)
-        den = p_dot_U - p_dot_L       # (B,)
+        den = p_dot_U - p_dot_L  # (B,)
 
         # Target alpha interval coming from wl < p^T(L + alpha(U-L)) < wh
         # a = (target - p^T L) / (p^T U - p^T L)
@@ -1132,20 +1392,30 @@ class StockSolver(torch.nn.Module):
         # Construct x
         return L + alpha.unsqueeze(1) * (U - L)
 
-    def _convert_price(self, p: torch.Tensor, x0: torch.Tensor):
-        p0 = p.repeat(self.m.shape[0], 1)  # TODO: change to m.size(0)
-        m1 = (
-            -self.m
-            + p
-            + 2.0 * torch.bmm(self.X.unsqueeze(1), self.Q).squeeze(1)
-        )
-        L = -1.0 / p * (self.budget * self.kappa).unsqueeze(1) - self.X
-        U = 1.0 / p * (self.budget * self.theta).unsqueeze(1) - self.X
+    @staticmethod
+    def _convert_price(
+        Q: torch.Tensor,
+        m: torch.Tensor,
+        c: torch.Tensor,
+        X: torch.Tensor,
+        budget: torch.Tensor,
+        kappa: torch.Tensor,
+        theta: torch.Tensor,
+        p: torch.Tensor,
+        x0: torch.Tensor,
+    ):
+        p = p.to(dtype=Q.dtype, device=Q.device)
+        m = m.to(dtype=Q.dtype, device=Q.device)
+        X = X.to(dtype=Q.dtype, device=Q.device)
+        p0 = p.repeat(m.shape[0], 1)  # TODO: change to m.size(0)
+        m1 = -m + p + 2.0 * torch.bmm(X.unsqueeze(1), Q).squeeze(1)
+        L = -1.0 / p * (budget * kappa).unsqueeze(1) - X
+        U = 1.0 / p * (budget * theta).unsqueeze(1) - X
         # because of sign, theta and kappa are swapped, this is not an error!
         # this is cash restriction !
         # replace self.theta, self.kappa to change cash budget multiplier
-        wl = (self.budget * (1.0 - self.theta)) - (self.X * p0).sum(dim=1)
-        wh = (self.budget * (1.0 + self.kappa)) - (self.X * p0).sum(dim=1)
+        wl = (budget * (1.0 - theta)) - (X * p0).sum(dim=1)
+        wh = (budget * (1.0 + kappa)) - (X * p0).sum(dim=1)
         # validate starting point and update if needed
         with torch.no_grad():
             x0_dot_p = bdot(x0, p0)
@@ -1156,51 +1426,59 @@ class StockSolver(torch.nn.Module):
                 | torch.any(x0_dot_p < wl)
             )
             x0_adj = torch.where(
-                invalid, self._find_start_point(p0, wl, wh, L, U), x0
+                invalid,
+                StockSolverFunc._find_start_point(p0, wl, wh, L, U),
+                x0,
             )
         return p0, m1, wl, wh, L, U, x0_adj
 
-    def forward(self, p: torch.Tensor):
-        BTG = 1e30
-        return self.solve_x0(p.to(self.Q.dtype), torch.full_like(self.X, BTG))
+    # --------- hooks subclasses must provide ----------
+    @staticmethod
+    def compute(
+        Q: torch.Tensor,  # (B, n, n)
+        m: torch.Tensor,  # (B, n)
+        c: torch.Tensor,  # (B, )
+        X: torch.Tensor,  # (B, n)
+        budget: torch.Tensor,  # (B, )
+        kappa: torch.Tensor,  # (B, )
+        theta: torch.Tensor,  # (B, )
+        p: torch.Tensor,  # (n)
+        x0: torch.Tensor,  # (B, n)
+    ) -> Tuple[torch.Tensor, ...] | torch.Tensor:
+        StockSolverFunc._validate(Q, m, c, X, budget, kappa, theta)
+        p0, m1, wl, wh, L, U, x0_adj = StockSolverFunc._convert_price(
+            Q, m, c, X, budget, kappa, theta, p, x0
+        )
+        return ActiveSetQPFunc.compute(Q, m1, c, wl, wh, L, U, p0, x0_adj)[0]
 
-    def solve_x0(self, p: torch.Tensor, x0: torch.Tensor):
-        p0, m1, wl, wh, L, U, x0_adj = self._convert_price(p, x0)
-        return solve_QP_problem(self.Q, m1, self.c, wl, wh, L, U, p0, x0_adj)
+    @staticmethod
+    def compute_primals(
+        *inputs: torch.Tensor, outputs: Tuple[torch.Tensor, ...] | torch.Tensor
+    ) -> Any:
+        Q, m, c, X, budget, kappa, theta, p, _ = inputs
 
-    def solve_sum(self, p: torch.Tensor):
-        return self.forward(p).sum(dim=0)
-
-    def solve_sum_x0(self, p: torch.Tensor, x0: torch.Tensor):
-        return self.solve_x0(p, x0).sum(dim=0)
-
-    def compute_primals(self, p: torch.Tensor):
-        B = self.m.shape[0]
+        B = m.shape[0]
         n = p.shape[-1]
 
         # ---- Primal preprocessing (same as your _convert_price/forward) ----
         # we pass a dummy x0; it won't affect the result and dx0 = 0
-        dummy_x0 = torch.zeros_like(self.X)
+        dummy_x0 = torch.zeros_like(X)
 
         p0 = p.repeat(B, 1)  # (B, n)
 
-        # m1 = self.m - p + 2 * (X Q)
-        m1 = (
-            -self.m
-            + p
-            + 2.0 * torch.bmm(self.X.unsqueeze(1), self.Q).squeeze(1)
-        )
+        # m1 = m - p + 2 * (X Q)
+        m1 = -m + p + 2.0 * torch.bmm(X.unsqueeze(1), Q).squeeze(1)
 
         # L = -(budget*kappa)/p - X ;  U = (budget*theta)/p - X
-        ak = (self.budget * self.kappa).unsqueeze(1)  # (B,1)
-        at = (self.budget * self.theta).unsqueeze(1)  # (B,1)
-        L = -ak / p - self.X
-        U = at / p - self.X
+        ak = (budget * kappa).unsqueeze(1)  # (B,1)
+        at = (budget * theta).unsqueeze(1)  # (B,1)
+        L = -ak / p - X
+        U = at / p - X
 
         # wl = budget*(1-theta) - <X, p0>,  wh = budget*(1+kappa) - <X, p0>
-        Xp = (self.X * p0).sum(dim=1)  # (B,)
-        wl = (self.budget * (1.0 - self.theta)) - Xp
-        wh = (self.budget * (1.0 + self.kappa)) - Xp
+        Xp = (X * p0).sum(dim=1)  # (B,)
+        wl = (budget * (1.0 - theta)) - Xp
+        wh = (budget * (1.0 + kappa)) - Xp
 
         # keep the same feasibility adjustment logic, but it won't matter for dx
         with torch.no_grad():
@@ -1213,218 +1491,223 @@ class StockSolver(torch.nn.Module):
             )
             x0_adj = torch.where(
                 invalid.unsqueeze(-1),
-                self._find_start_point(p0, wl, wh, L, U),
+                StockSolverFunc._find_start_point(p0, wl, wh, L, U),
                 dummy_x0,
             )
 
         # ---- Primal call ----
-        x = solve_QP_problem(self.Q, m1, self.c, wl, wh, L, U, p0, x0_adj)
-
-        active_comp = (x == L) | (x == U)
-        active_values = torch.where(
-            active_comp, torch.where(x == L, L, U), 0.0
-        )
-        active_budget = (torch.abs(bdot(x, p) - wl) < 1e-9) | (
-            torch.abs(bdot(x, p) - wh) < 1e-9
-        )
-        budget_w = torch.where(
-            active_budget,
-            torch.where(
-                torch.abs(bdot(x, p) - wl) < 1e-9,
-                wl,
-                wh,
-            ),
-            0.0,
-        )
-        saved_vars = (
-            self.Q,
-            m1,
-            wl,
-            wh,
-            L,
-            U,
-            p0,
-            active_comp,
-            active_values,
-            active_budget,
-            budget_w,
-        )
+        outputs = ActiveSetQPFunc.apply(Q, m1, c, wl, wh, L, U, p0, x0_adj)
+        x = outputs[0]
 
         # ---- JVP of the QP solve (single linearized KKT solve) ----
         # This calls your closed-form JVP; no AD/tracing involved.
-        primals = ActiveSetQPFunc._process_primals(saved_vars)
-        return (x, p, ak, at, self.X) + primals
+        inputs = Q, m1, None, wl, wh, L, U, p0, None
+        # outputs = None, active_comp, active_values, active_budget, budget_w
+        primals = ActiveSetQPFunc.compute_primals(*inputs, outputs=outputs)
+        return (
+            StockSolverPrimals(
+                outputs[0], p, budget, kappa, theta, ak, at, X, Q
+            )
+            + primals
+        )
 
     @staticmethod
-    def compute_tangent(dp: torch.Tensor, all_primals: tuple):
-        # ---- Tangent preprocessing (differentiate everything above w.r.t. p) ----
-        x, p, ak, at, X, *primals = all_primals
+    def vjp_from_primals(
+        saved: Any,  # saved primals
+        *cotangents: torch.Tensor,
+        needs_input_grad: Sequence[bool] | None = None,
+    ) -> Tuple[torch.Tensor | None, ...]:
+        """
+        VJP to original inputs using ActiveSetQPFunc.vjp_from_primals.
+        Returns grads in order:
+          (gQ, gm, gc, gX, gbudget, gkappa, gtheta, gp, gx0)
+        """
+        # Single differentiable output (x); rest are non-diff
+        (v, *_) = cotangents
+        primals, inner_saved = StockSolverFunc._unpack_primals(saved)
+        x, p, budget, kappa, theta, ak, at, X, Q = primals
+        B, n = X.shape
 
-        B, n = x.shape
+        # 1) VJP through inner ActiveSetQPFunc (public API)
+        # cotangents for outputs (x, active_comp, active_values, active_budget, budget_w)
+        gQ_solve, gm1, gc, gwl, gwh, gL, gU, gp0, gx0 = (
+            ActiveSetQPFunc.vjp_from_primals(
+                tuple(inner_saved),
+                v,
+                None,
+                None,
+                None,
+                None,
+                needs_input_grad=None,
+            )
+        )
 
-        # broadcast helpers
+        # Route adjoints to original inputs through preprocessing:
+
+        # Q: from inner plus from m1 = -m + p + 2 (X @ Q)  ⇒
+        # ∂/∂Q_b = 2 * outer(X_b, gm1_b)
+        gQ = gQ_solve + 2.0 * torch.einsum("bi,bj->bij", X, gm1)
+
+        # m: m1 = -m + ...  ⇒ grad_m = -gm1
+        gm = -gm1
+
+        # c: passed through unchanged in our smooth path (no contribution)
+        gc = torch.zeros_like(budget)
+
+        # X:
+        #   from m1: 2 * (Q^T @ gm1)
+        #   from L,U: -gL, -gU
+        #   from wl,wh: -(gwl + gwh) * p0
+        gX = 2.0 * torch.bmm(Q.transpose(-1, -2), gm1.unsqueeze(-1)).squeeze(
+            -1
+        )
+        gX = gX - gL - gU - (gwl + gwh).unsqueeze(1) * inner_saved[6]  # p0
+
+        # budget:
+        invp = (1.0 / p).unsqueeze(0)  # (1,n)
+        gbudget = (
+            (-(kappa.unsqueeze(1) * invp) * gL).sum(dim=1)
+            + ((theta.unsqueeze(1) * invp) * gU).sum(dim=1)
+            + (1.0 - theta) * gwl
+            + (1.0 + kappa) * gwh
+        )
+
+        # kappa:
+        gkappa = (-(budget.unsqueeze(1) * invp) * gL).sum(dim=1) + budget * gwh
+
+        # theta:
+        gtheta = ((budget.unsqueeze(1) * invp) * gU).sum(dim=1) - budget * gwl
+
+        # p (market-wide vector):
+        #   from m1: + sum_b gm1_b
+        #   from p0: + sum_b gp0_b
+        #   from L:  + sum_b gL_b * (budget*kappa)/p^2
+        #   from U:  + sum_b gU_b * (-(budget*theta))/p^2
+        #   from wl,wh: - sum_b (gwl_b + gwh_b) * X_b
+        invp2 = (1.0 / (p * p)).unsqueeze(0)
+        gp = (
+            gm1.sum(dim=0)
+            + gp0.sum(dim=0)
+            + ((budget.unsqueeze(1) * kappa.unsqueeze(1) * invp2) * gL).sum(
+                dim=0
+            )
+            - ((budget.unsqueeze(1) * theta.unsqueeze(1) * invp2) * gU).sum(
+                dim=0
+            )
+            - ((gwl + gwh).unsqueeze(1) * X).sum(dim=0)
+        )
+
+        # x0: you treat the start projection as non-differentiable → zero
+        gx0 = torch.zeros_like(x)
+
+        grads = (gQ, gm, gc, gX, gbudget, gkappa, gtheta, gp, gx0)
+
+        # Respect needs_input_grad
+        if needs_input_grad is not None:
+            grads = list(grads)
+            for i, need in enumerate(needs_input_grad):
+                if not need:
+                    grads[i] = None
+            grads = tuple(grads)
+        return grads
+
+    @staticmethod
+    def jvp_from_primals(
+        all_primals: Any, *all_tangents: tuple | None
+    ) -> torch.Tensor:
+        """
+        JVP through:
+          (Q, m, c, X, budget, kappa, theta, p, x0)
+            -> (Q, m1, c, wl, wh, L, U, p0, x0)
+            -> dx
+        using ActiveSetQPFunc.jvp_from_primals.
+
+        Return dx (B, n)
+        """
+        (dQ, dm, dc, dX, dbudget, dkappa, dtheta, dp, dx0) = all_tangents
+        primals, inner_saved = StockSolverFunc._unpack_primals(all_primals)
+        x, p, budget, kappa, theta, ak, at, X, Q = primals
+        Q, m1, wl, wh, L, U, p0, *_ = inner_saved
+        B, n = X.shape
+
+        # Default missing tangents to zeros
+        if dQ is None:
+            dQ = torch.zeros_like(Q)
+        if dm is None:
+            dm = torch.zeros_like(m1)  # original m; will convert to dm1 below
+        if dc is None:
+            dc = torch.zeros_like(wl)
+        if dX is None:
+            dX = torch.zeros_like(X)
+        if dbudget is None:
+            dbudget = torch.zeros_like(budget)
+        if dkappa is None:
+            dkappa = torch.zeros_like(kappa)
+        if dtheta is None:
+            dtheta = torch.zeros_like(theta)
+        if dp is None:
+            dp = torch.zeros_like(p)
+        if dx0 is None:
+            dx0 = torch.zeros_like(x)
+
+        # Broadcast helpers
         dp0 = dp.unsqueeze(0).expand(B, -1)  # (B, n)
-        invp2 = (p * p).unsqueeze(0)  # (1, n)
+        invp = (1.0 / p).unsqueeze(0)  # (1, n)
+        invp2 = (1.0 / (p * p)).unsqueeze(0)  # (1, n)
 
-        dm = dp0  # (B, n)
+        # m1 = -m + p + 2 * (X @ Q)
+        dXQ = torch.bmm(dX.unsqueeze(1), Q).squeeze(1)
+        XdQ = torch.bmm(X.unsqueeze(1), dQ).squeeze(1)
+        dm1 = -dm + dp0 + 2.0 * (dXQ + XdQ)
 
-        # dL/dp =  (ak)/p^2 * dp   ;   dU/dp = -(at)/p^2 * dp
-        dL = (ak / invp2) * dp0  # (B, n)
-        dU = -(at / invp2) * dp0  # (B, n)
-
-        # dwl/dp = dwh/dp = - sum_i X_{b,i} * dp_i
-        dsum = (X * dp0).sum(dim=1)  # (B,)
-        dwl = -dsum
-        dwh = -dsum
-
-        # dp0 is the input tangent for p0
-        dp_in = dp0
-
-        # constants (no dependence on p)
-        dQ = torch.zeros((B, n, n), dtype=x.dtype, device=x.device)
-        dc = torch.zeros((B, n), dtype=x.dtype, device=x.device)
-        dx0 = torch.zeros((B, n), dtype=x.dtype, device=x.device)
-
-        jv = ActiveSetQPFunc._jvp_int(
-            tuple(primals), dQ, dm, dc, dwl, dwh, dL, dU, dp_in, dx0
+        # L,U, wl, wh tangents from (budget, kappa, theta, p, X)
+        dL = (
+            -(
+                dbudget.unsqueeze(1) * kappa.unsqueeze(1)
+                + budget.unsqueeze(1) * dkappa.unsqueeze(1)
+            )
+            * invp
+            + ((budget.unsqueeze(1) * kappa.unsqueeze(1)) * invp2) * dp0
+            - dX
         )
-        return jv.sum(dim=0)
-
-    @staticmethod
-    def compute_cotangent(v: torch.Tensor, all_primals: tuple):
-        """
-        Given adjoint v on F(p) = solve_sum(p) ∈ R^n, return (dF/dp)^T v ∈ R^n,
-        using only saved primals (no autograd graph required).
-        """
-        # Unpack everything we need (exactly the same structure returned by compute_primals)
-        (x, p, ak, at, X,
-         Q, m1, wl, wh, L, U, p0,
-         active_comp, active_values, active_budget, budget_w,
-         H, p_eff, Lc, x_eq, y, p_dot_xeq, denom_proj, alpha) = all_primals
-
-        B, n = x.shape
-        # Upstream adjoint on each batch's x_b is v (because F = sum_b x_b)
-        grad_x = v.unsqueeze(0).expand(B, -1)
-
-        # VJP through ActiveSetQP: get adjoints wrt {m1, p0, active_values, budget_w}
-        grad_Q, grad_m1, grad_p0, grad_av, grad_bw = ActiveSetQPFunc._grad_solve(
-            Q, m1, p0, active_comp, active_values, active_budget, budget_w, grad_x
+        dU = (
+            (
+                dbudget.unsqueeze(1) * theta.unsqueeze(1)
+                + budget.unsqueeze(1) * dtheta.unsqueeze(1)
+            )
+            * invp
+            - ((budget.unsqueeze(1) * theta.unsqueeze(1)) * invp2) * dp0
+            - dX
         )
+        dsum = (X * dp0 + dX * p0).sum(dim=1)  # (B,)
+        dwl = dbudget * (1.0 - theta) - budget * dtheta - dsum
+        dwh = dbudget * (1.0 + kappa) + budget * dkappa - dsum
 
-        # Route adjoints to L/U and wl/wh the same way as in ActiveSetQPFunc.backward
-        grad_L = torch.where(
-            active_comp & (active_values == L), grad_av, torch.zeros_like(grad_av)
+        # Inner JVP (public API)
+        dx, *_ = ActiveSetQPFunc.jvp_from_primals(
+            tuple(inner_saved),
+            dQ,
+            dm1,
+            dc,
+            dwl,
+            dwh,
+            dL,
+            dU,
+            dp0,
+            torch.zeros_like(x),
         )
-        grad_U = torch.where(
-            active_comp & (active_values == U), grad_av, torch.zeros_like(grad_av)
-        )
-        grad_wl = torch.where(
-            active_budget & (budget_w == wl), grad_bw, torch.zeros_like(grad_bw)
-        )
-        grad_wh = torch.where(
-            active_budget & (budget_w == wh), grad_bw, torch.zeros_like(grad_bw)
-        )
-
-        # Now VJP through the algebra mapping p -> (m1, p0, L, U, wl, wh)
-
-        # p is market-wide (unbatched); p0 is repeat across batches
-        # m1 = -m + p + const  ->  dm1/dp = I  (broadcast)
-        # p0 = repeat(p)       ->  dp0/dp = repeat; sum adjoints over batch
-
-        g_p = torch.zeros_like(p)  # (n,)
-
-        # m1 contribution
-        g_p = g_p + grad_m1.sum(dim=0)
-
-        # p0 contribution
-        g_p = g_p + grad_p0.sum(dim=0)
-
-        # L = -ak / p - X  -> dL/dp_i =  ak_b / p_i^2
-        invp2 = p * p  # (n,)
-        g_p = g_p + ( (ak / invp2.unsqueeze(0)) * grad_L ).sum(dim=0)
-
-        # U =  at / p - X  -> dU/dp_i = -at_b / p_i^2
-        g_p = g_p + ( (-at / invp2.unsqueeze(0)) * grad_U ).sum(dim=0)
-
-        # wl = budget*(1-theta) - <X_b, p>, same for wh
-        # ∂wl/∂p_i = ∂wh/∂p_i = -X_{b,i}
-        g_p = g_p + ( -(grad_wl + grad_wh).unsqueeze(1) * X ).sum(dim=0)
-
-        return g_p
-    
-    @torch.no_grad()
-    def linearize_forward(self, p: torch.Tensor):
-        # Compute primals once
-        self.all_primals = self.compute_primals(p)
-
-    @torch.no_grad()
-    def forward_jvp(self, dp: torch.Tensor):
-        return StockSolver.compute_tangent(dp, self.all_primals)
-
-    @torch.no_grad()
-    def forward_vjp(self, v: torch.Tensor):
-        # (dF/dp)^T v using only saved primals
-        return StockSolver.compute_cotangent(v, self.all_primals)
-
-    @torch.no_grad()
-    def matvec(self, x):
-        return self.forward_jvp(x)  # J @ x        
-
-class StockSolverParams(NamedTuple):
-    Sigma: torch.Tensor
-    M: torch.Tensor
-    c: torch.Tensor
-    X: torch.Tensor
-    budget: torch.Tensor
-    kappa: torch.Tensor
-    theta: torch.Tensor
-
-
-class StockSolverPrimals(NamedTuple):
-    Sigma: torch.Tensor
-    M: torch.Tensor
-    X: torch.Tensor
-    wl: torch.Tensor
-    wh: torch.Tensor
-    L: torch.Tensor
-    U: torch.Tensor
-    p: torch.Tensor
-    active_comp: torch.Tensor
-    active_values: torch.Tensor
-    active_budget: torch.Tensor
-    budget_w: torch.Tensor
-    H: torch.Tensor
-    p_eff: torch.Tensor
-    Lc: torch.Tensor
-    x_eq: torch.Tensor
-    y: torch.Tensor
-    p_dot_xeq: torch.Tensor
-    denom_proj: torch.Tensor
-    alpha: torch.Tensor
-    x: torch.Tensor
-    ak: torch.Tensor
-    at: torch.Tensor
-
-
-class StockSolverFunc(torch.autograd.Function):
-    @staticmethod
-    def forward(params: StockSolverParams, p: torch.Tensor, x0: torch.Tensor):
-        pass
-
-    @staticmethod
-    def linearize_forward(
-        params: StockSolverParams, p: torch.Tensor
-    ) -> StockSolverPrimals:
-        pass
-
-    @staticmethod
-    def forward_jvp(
-        primals: StockSolverPrimals, grad_p: torch.Tensor
-    ) -> StockSolverPrimals:
-        pass
+        return dx
 
 
 class GMRESSolver:
+    @classmethod
+    def matvec(cls, x, primals):
+        raise NotImplementedError
+
+    @classmethod
+    def compute_residual(cls, b, x, primals):
+        raise NotImplementedError
+
     @staticmethod
     def _safe_normalize(x: torch.Tensor, thresh: float | None = None):
         """
@@ -1474,11 +1757,13 @@ class GMRESSolver:
         q = q1 - (Q @ h)
         return q, r
 
+    @classmethod
     def _kth_arnoldi_iteration(
-        self,
+        cls,
         k: torch.Tensor,  # scalar int tensor
         V: torch.Tensor,  # (m, restart+1)
         H: torch.Tensor,  # (restart, restart+1)
+        primals,  # tuple
     ):
         device, dtype = V.device, V.dtype
         m, ncols = V.shape
@@ -1491,7 +1776,7 @@ class GMRESSolver:
         v_k = V @ e_k  # (m,)
 
         # Arnoldi “apply, orthogonalize”
-        w = self.matvec(v_k)
+        w = cls.matvec(v_k, primals)
         _, w_norm0 = GMRESSolver._safe_normalize(w)
 
         # Project against ALL columns in V (unused ones are zeros, so harmless)
@@ -1532,26 +1817,18 @@ class GMRESSolver:
         return V_new, H_new, breakdown
 
     @staticmethod
-    def loop_cond(V, H, breakdown, k, restart):
+    def _loop_cond(V, H, breakdown, k, restart, *_):
         return (k < restart) & (~breakdown)
 
-    def arnoldi_process(self, V, H, breakdown, k, restart):
-        V2, H2, breakdown2 = self._kth_arnoldi_iteration(k, V, H)
+    @classmethod
+    def _arnoldi_process(cls, V, H, breakdown, k, restart, *primals):
+        V2, H2, breakdown2 = cls._kth_arnoldi_iteration(k, V, H, primals)
         return V2, H2, breakdown2, k + 1
 
+    @classmethod
     def _gmres_batched(
-        self, b, x0, unit_residual, residual_norm, restart: int
+        cls, b, x0, unit_residual, residual_norm, restart: int, primals
     ):
-        """
-        One GMRES restart (left-preconditioned):
-          - Builds up to `restart` Krylov vectors with Arnoldi using operator M @ A.
-          - Solves min_y || H_j^T y - beta * e1 || and returns x = x0 + V_j y.
-          - Returns (x, unit_residual_new, residual_norm_new).
-        A: callable (m,) -> (m,)
-        b, x0, unit_residual: (m,)
-        residual_norm: scalar tensor
-        M: (m, m) tensor (left preconditioner applied by @)
-        """
         device, dtype = b.device, b.dtype
         m = b.shape[0]
         ncols = restart + 1
@@ -1568,19 +1845,11 @@ class GMRESSolver:
         k0 = torch.tensor(0, dtype=torch.int64, device=device)
         br0 = torch.tensor(False, dtype=torch.bool, device=device)
 
-        idx_cols = torch.arange(ncols, device=device)  # [0, 1, ..., restart]
-        idx_rows = torch.arange(
-            restart, device=device
-        )  # [0, 1, ..., restart-1]
-        eps = torch.as_tensor(
-            torch.finfo(dtype).eps, dtype=dtype, device=device
-        )
-
         V, H, _, k = ops.higher_order.while_loop(
-            GMRESSolver.loop_cond,
-            self.arnoldi_process,
+            GMRESSolver._loop_cond,
+            cls._arnoldi_process,
             (V0, H0, br0, k0),
-            (restart,),
+            (restart,) + primals,
         )
         # Solve least squares: (Hj^T) y ≈ beta * e1   with Hj = H[:j, :j+1]
         # Fixed-shape LS: solve min || H^T y - beta e1 ||
@@ -1612,7 +1881,7 @@ class GMRESSolver:
         x = x0 + dx
 
         # New (preconditioned) residual
-        residual = self.compute_residual(b, x)
+        residual = cls.compute_residual(b, x, primals)
 
         unit_residual_new, residual_norm_new = GMRESSolver._safe_normalize(
             residual
@@ -1621,18 +1890,23 @@ class GMRESSolver:
         return x, unit_residual_new, residual_norm_new
 
     @staticmethod
-    def _gmres_cond_fun(x, k, ures, rnorm, b, maxiter, thresh, restart):
+    def _gmres_cond_fun(x, k, ures, rnorm, b, maxiter, thresh, restart, *_):
         return (k < maxiter) & (rnorm > thresh)
 
-    def _gmres_body_fun(self, x, k, ures, rnorm, b, maxiter, thresh, restart):
-        x_new, ures_new, rnorm_new = self._gmres_batched(
-            b, x, ures, rnorm, restart
+    @classmethod
+    def _gmres_body_fun(
+        cls, x, k, ures, rnorm, b, maxiter, thresh, restart, *primals
+    ):
+        x_new, ures_new, rnorm_new = cls._gmres_batched(
+            b, x, ures, rnorm, restart, primals
         )
         return x_new, k + 1, ures_new, rnorm_new
 
+    @classmethod
     def gmres(
-        self,
+        cls,
         b: torch.Tensor,
+        primals,
         x0: torch.Tensor | None = None,
         tol: float = 1e-5,
         atol: float = 0.0,
@@ -1691,9 +1965,6 @@ class GMRESSolver:
         if x0 is None:
             x0 = torch.zeros_like(b)
 
-        if maxiter is None:
-            maxiter = 10 * m  # common default
-
         restart = int(min(restart, m))
 
         if x0.shape != b.shape:
@@ -1707,7 +1978,7 @@ class GMRESSolver:
         )
 
         # Initial (left-preconditioned) residual
-        residual0 = self.compute_residual(b, x0)
+        residual0 = cls.compute_residual(b, x0, primals)
         unit_residual, residual_norm = GMRESSolver._safe_normalize(residual0)
 
         # Early exit if already converged
@@ -1717,265 +1988,533 @@ class GMRESSolver:
         # while_loop state must be tensors
         k0 = torch.tensor(0, dtype=torch.int64, device=device)
 
+        if maxiter is None:
+            maxiter_t = torch.tensor(10 * m, device=device, dtype=torch.int64)
+        else:
+            maxiter_t = torch.as_tensor(
+                maxiter, device=device, dtype=torch.int64
+            )
+
         (
             x_final,
             *_,
         ) = ops.higher_order.while_loop(
             GMRESSolver._gmres_cond_fun,
-            self._gmres_body_fun,
+            cls._gmres_body_fun,
             (x0, k0, unit_residual, residual_norm),
-            (b, torch.as_tensor(maxiter), torch.as_tensor(thresh), restart),
+            (b, maxiter_t, thresh, restart) + primals,
         )
 
         return x_final
 
 
-def newton_krylov(
-    s,
-    x0,
-    S,
-    tol=1e-8,
-    rtol=1e-8,
-    lstol=1e-6,
-    max_outer=50,
-    gmres_restart=20,
-    gmres_maxiter=200,
-    positive=False,
-    verbose=False,
+def _to_float64_preserve_grad(x):
+    """Cast to float64 without detaching; create tensor only if needed."""
+    if isinstance(x, torch.Tensor):
+        return x if x.dtype == torch.float64 else x.to(torch.float64)
+    return torch.as_tensor(x, dtype=torch.float64)
+
+
+def optimize_portfolio(
+    Sigma,
+    expected_returns,
+    commission,
+    holdings,
+    budget,
+    short_leverage,
+    long_leverage,
+    prices,
 ):
     """
-    Solve f(x)=0 with Newton–Krylov (GMRES) using only JVPs.
+    Optimize a single portfolio or a batch of portfolios under budget, short,
+    and long leverage constraints.
 
-    f : callable x -> F(x) (same shape),
-    autograd-friendly (use torch.stack, not torch.tensor([...])).
-    x0 : 1D tensor initial guess.
+    Batching
+    --------
+    Supports single or batched optimization. When batched, **all parameters
+    except `prices` must be stacked along dimension 0** (the batch dimension).
+    **`prices` is a market-wide vector shared by everyone and MUST
+    be unbatched** (shape (N,)); it will be internally broadcast across the batch.
 
-    Returns x
+    The method accepts PyTorch tensors or any array-like objects convertible
+    to `torch.Tensor`, and is fully differentiable (autograd-friendly).
+
+    Parameters
+    ----------
+    Sigma : (N, N) or (B, N, N)
+        Expected covariance matrix (PSD). Batched as (B, N, N).
+    expected_returns : (N,) or (B, N)
+        Expected returns. Batched as (B, N).
+    commission : () or (B, )
+        Per-agent commission to **buy**. Use zeros for initial portfolios.
+    holdings : (N,) or (B, N)
+        Current holdings (shares). Use zeros for initial portfolios.
+    budget : () or (B,)
+        Total budget (scalar or batched scalar).
+    short_leverage : () or (N,) or (B,) or (B, N)
+        Per-security short cap as a fraction of `budget`. `0` ⇒ no short sales.
+    long_leverage : () or (N,) or (B,) or (B, N)
+        Per-security long cap as a fraction of `budget`. Values < 1 ⇒ no leverage.
+    prices : (N,)
+        **Market prices** shared by all agents. **Must be 1-D (N,)**;
+        batches are not allowed.
+
+    Returns
+    -------
+    optimal_holdings : (N,) or (B, N) torch.Tensor
+        Optimal post-trade holdings satisfying constraints.
+
+    Notes
+    -----
+    - `prices` is **unbatched** by design (market-wide).
+    - All other inputs follow the single vs. batched rules above.
+    - Fully differentiable; non-tensors are converted to tensors.
+
+    Examples
+    --------
+    Single portfolio
+    >>> h = optimize_portfolio(Sigma, mu, commission=torch.zeros_like(mu),
+    ...     holdings=torch.zeros_like(mu), budget=1.0,
+    ...     short_leverage=0.0, long_leverage=1.0, prices=prices)
+
+    Batched portfolios (B, N) with shared market prices (N,)
+    >>> h_b = optimize_portfolio(Sigma_b, mu_b, commission_b, holdings_b,
+    ...     budget_b, short_leverage=0.0, long_leverage=1.0, prices=prices)
     """
-    trajectory = []
-    x = x0.clone().detach()
-
-    F = s.solve_sum(x) - S
-    norm0 = torch.linalg.vector_norm(F)
-    if norm0 == 0.0:
-        return x
-
-    for it in range(1, max_outer + 1):
-        r = F.clone()
-
-        # Inexact Newton forcing term (Eisenstat–Walker-like)
-        eta = min(
-            0.1, 0.5 * math.sqrt(max(1e-300, torch.linalg.norm(F) / norm0))
+    if Sigma.ndim == 2:
+        return StockSolverFunc(
+            _to_float64_preserve_grad(Sigma, dtype=torch.float64).unsqueeze(0),
+            _to_float64_preserve_grad(
+                expected_returns, dtype=torch.float64
+            ).unsqueeze(0),
+            _to_float64_preserve_grad(
+                commission, dtype=torch.float64
+            ).unsqueeze(0),
+            _to_float64_preserve_grad(holdings, dtype=torch.float64).unsqueeze(
+                0
+            ),
+            _to_float64_preserve_grad(budget, dtype=torch.float64).unsqueeze(
+                0
+            ),
+            _to_float64_preserve_grad(
+                short_leverage, dtype=torch.float64
+            ).unsqueeze(0),
+            _to_float64_preserve_grad(
+                long_leverage, dtype=torch.float64
+            ).unsqueeze(0),
+            _to_float64_preserve_grad(prices, dtype=torch.float64),
+        )
+    else:
+        return StockSolverFunc(
+            _to_float64_preserve_grad(Sigma, dtype=torch.float64),
+            _to_float64_preserve_grad(expected_returns, dtype=torch.float64),
+            _to_float64_preserve_grad(commission, dtype=torch.float64),
+            _to_float64_preserve_grad(holdings, dtype=torch.float64),
+            _to_float64_preserve_grad(budget, dtype=torch.float64),
+            _to_float64_preserve_grad(short_leverage, dtype=torch.float64),
+            _to_float64_preserve_grad(long_leverage, dtype=torch.float64),
+            _to_float64_preserve_grad(prices, dtype=torch.float64),
         )
 
-        # Linear operator for GMRES
-        s.linearize_forward(x)
 
-        # Solve J(x) Δ = -F(x)
-        dx = s.gmres(
-            -r,
-            x0=x.clone(),
-            tol=eta,
-            atol=0.0,
-            restart=gmres_restart,
-            maxiter=gmres_maxiter,
+class StockSolverSum(ExplicitADFunction, GMRESSolver):
+    """
+    Sum-reduction wrapper around StockSolverFunc:
+      y = sum_b StockSolverFunc(Q, m, c, X, budget, kappa, theta, p, x0)[b, :]
+    Reuses StockSolverFunc.{compute, compute_primals, vjp_from_primals, jvp_from_primals}.
+    """
+
+    # ---------- Interface required by ExplicitADFunction ----------
+
+    @staticmethod
+    def compute(
+        Q: torch.Tensor,
+        m: torch.Tensor,
+        c: torch.Tensor,
+        X: torch.Tensor,
+        budget: torch.Tensor,
+        kappa: torch.Tensor,
+        theta: torch.Tensor,
+        p: torch.Tensor,
+        x0: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Forward: call StockSolverFunc.compute to get x (B, n), then sum over dim=0 -> (n,)
+        """
+        x = StockSolverFunc.compute(
+            Q, m, c, X, budget, kappa, theta, p, x0
+        )  # (B, n)
+        return x.sum(dim=0)  # (n,)
+
+    @staticmethod
+    def compute_primals(
+        *inputs: torch.Tensor, outputs: Tuple[torch.Tensor, ...] | torch.Tensor
+    ) -> Any:
+        """
+        Primals: just delegate to StockSolverFunc.compute_primals so we can reuse its
+        saved structure for VJP/JVP. We ignore our own reduced `outputs`.
+        """
+        # NOTE: StockSolverFunc.compute_primals returns a tuple that starts with
+        # (x, p, budget, kappa, theta, ak, at, X, ...) and includes everything
+        # needed to run inner vjp/jvp without autograd tracing.
+        return StockSolverFunc.compute_primals(*inputs, outputs=outputs)
+
+    @staticmethod
+    def vjp_from_primals(
+        saved: Any,
+        *cotangents: torch.Tensor,
+        needs_input_grad: Sequence[bool] | None = None,
+    ) -> Tuple[torch.Tensor | None, ...]:
+        """
+        Backward (VJP): Our output is y = sum_b x_b, so the cotangent
+        for each x_b is the same v. Delegate inner VJP to StockSolverFunc and
+        return grads for (Q, m, c, X, budget, kappa, theta, p, x0).
+        """
+        # Unpack batch size B and feature size n from saved
+        # (X is at index 7 in StockSolverFunc saved)
+        # saved layout begins with: (x, p, budget, kappa, theta, ak, at, X, ...)
+        X = saved[7]  # (B, n)
+        B, _ = X.shape
+
+        (v,) = cotangents  # v is shape (n,)
+        v_batched = v.unsqueeze(0).expand(B, -1).contiguous()  # (B, n)
+
+        # Inner VJP expects cotangents for its 5 outputs:
+        # (x, active_comp, active_values, active_budget, budget_w)
+        inner_grads = StockSolverFunc.vjp_from_primals(
+            saved, v_batched, None, None, None, None, needs_input_grad=None
         )
-        F0 = torch.linalg.vector_norm(F)
-        t = 1.0
-        while t > lstol:
-            x_trial = x + t * dx
-            if torch.all(x_trial > 0.0) or not positive:
-                F_trial = s.solve_sum(x_trial) - S
-                if torch.linalg.vector_norm(F_trial) <= F0 and (
-                    (
-                        torch.all(x_trial > 0)
-                        and torch.all(x_trial < 2 * x)
-                        and torch.all(x_trial > x / 2)
-                    )
-                    or not positive
-                ):
-                    break
-            t *= 0.5
-        if t >= lstol:
-            x, F = x_trial.detach(), F_trial.detach()
-        res = torch.linalg.norm(F)
-        if verbose:
-            step_size = float(torch.norm(t * dx).item())
-            # print(x)
-            print(
-                f"[NK] it={it:02d}  ||F||={res:.4e}  step={t:.4e} "
-                f"step_size = {step_size:.4e}"
+        # inner_grads order: (gQ, gm, gc, gX, gbudget, gkappa, gtheta, gp, gx0)
+        grads = inner_grads
+
+        # Respect needs_input_grad mask if provided
+        # (ExplicitADFunction will also mask, but do it here too)
+        if needs_input_grad is not None:
+            grads = list(grads)
+            for i, need in enumerate(needs_input_grad):
+                if not need:
+                    grads[i] = None
+            grads = tuple(grads)
+        return grads
+
+    @staticmethod
+    def jvp_from_primals(
+        saved: Any, *tangents: torch.Tensor | None
+    ) -> Tuple[torch.Tensor, ...]:
+        """
+        Forward-mode (JVP): inner JVP gives dx (B, n).
+        Our output tangent is sum over batch -> (n,).
+        """
+        # Inner JVP (same tangent ordering as inputs):
+        # (dQ, dm, dc, dX, dbudget, dkappa, dtheta, dp, dx0)
+        dx_batched = StockSolverFunc.jvp_from_primals(
+            saved, *tangents
+        )  # (B, n)
+        dy = dx_batched.sum(dim=0)  # (n,)
+        return (dy,)
+
+    @classmethod
+    def matvec(cls, x, primals):
+        return cls.jvp_from_primals(primals, x)
+
+    @classmethod
+    def compute_residual(cls, b, x, primals):
+        return b - cls.matvec(x, primals)
+
+
+def _unwrap_single(x):
+    """Allow either Tensor or (Tensor,). Raise if multiple outputs."""
+    if isinstance(x, tuple):
+        if len(x) != 1:
+            raise TypeError(
+                "ImplicitFunction expects func to have a single-tensor output. "
+                f"Got a tuple of length {len(x)} from jvp/vjp."
             )
-        if res <= tol or res <= rtol * norm0 or t <= lstol:
-            return x
-
+        return x[0]
     return x
 
 
-class StockSolverGMRES(StockSolver, GMRESSolver):
-    def compute_residual(self, b, x):
-        return b - self.matvec(x)
+class ImplicitFunction(ExplicitADFunction):
+    """
+    Solve for one *variable input* x_var in a vector equation
 
+        F(*inputs) = y_target
 
-class BalanceFunc(GMRESSolver):
-    def __init__(self):
-        pass
+    using a Newton–Krylov method with GMRES-based linear solves, and expose
+    reverse-mode (VJP) for the implicit map g: (y_target, *inputs_fixed) -> x_var.
 
-    def _save(self, Q, m, c, X, budget, kappa, theta, S, p_star):
-        self.Q = Q
-        self.m = m
-        self.c = c
-        self.X = X
-        self.budget = budget
-        self.kappa = kappa
-        self.theta = theta
-        self.S = S
-        self.p_star = p_star
+    Usage pattern (important):
+      - Subclass this class and set:
+          func = <ExplicitADFunction subclass that also provides GMRES hooks>
+          variable_input = <1-based index of the input to solve for>
+      - Call .apply with *varargs* (no tuples!) so autograd can see all inputs:
+          x_var = MyImplicit.apply(y_target, in1, in2, ..., inN)
 
-    def update(self, Q, m, c, X, budget, kappa, theta, S, p_star):
-        self._save(Q, m, c, X, budget, kappa, theta, S, p_star)
-        stock_solver.update(Q, m, c, X, budget, kappa, theta)
-        # (∂F/∂p) u  at the fixed point p_star
-        stock_solver.linearize_forward(p_star)
+    Requirements on `func`:
+      - Implements ExplicitADFunction-style API:
+          compute(*inputs) -> Tensor
+          compute_primals(*inputs, outputs=Tensor) -> saved
+          jvp_from_primals(saved, *tangents_per_input) -> Tensor
+          vjp_from_primals(saved, bar_y, needs_input_grad=None) -> tuple(grads_per_input)
+        (Single-tensor output is assumed. If your F returns a tuple of outputs,
+         adapt this class: a single-output is required for GMRES right-hand side.)
+      - Provides GMRES interface via inheritance from your GMRESSolver:
+          matvec(x, primals) -> A @ x
+          compute_residual(b, x, primals) -> b - A @ x
+          gmres(b, primals, x0=None, tol=..., atol=..., restart=..., maxiter=...) -> x
 
-    def matvec(self, dp):
-        return stock_solver.forward_vjp(dp)
+    Contract with autograd:
+      - .apply is called as  x_var = ImplicitSubclass.apply(y_target, *inputs)
+      - vjp_from_primals must return (grad_wrt_y, *grads_wrt_inputs) to match the
+        number of *tensor* args passed to .apply.
+    """
 
-    def compute_residual(self, b, x):
-        return b - self.matvec(x)
+    # You MUST set these in a subclass, e.g.:
+    #   func = MyFunctionGMRES
+    #   variable_input = 3  # 1-based index of the variable among *inputs
+    func = None
+    variable_input: int | None = None  # 1-based index
 
+    # Newton–Krylov parameters
+    _newton_maxiter = 50
+    _newton_tol = 1e-10
 
-stock_solver = StockSolverGMRES(
-    torch.empty(1, 1, 1),
-    torch.empty(1, 1),
-    torch.empty(1),
-    torch.zeros(1, 1),
-    torch.ones(1),
-    torch.zeros(1),
-    torch.ones(1),
-)
+    # GMRES parameters (used for inner linear solves)
+    _gmres_restart = 20
+    _gmres_tol = 1e-8
+    _gmres_atol = 0.0
+    _gmres_maxiter = 200
 
-
-def stock_solver_func(Q, m, c, X, budget, kappa, theta, S, x0, p):
-    stock_solver.update(Q, m, c, X, budget, kappa, theta)
-    return stock_solver.solve_sum(p) - S
-
-
-balance_func = BalanceFunc()
-
-
-def balance_func_gmres(
-    Q, m, c, X, budget, kappa, theta, S, x0, p_star, grad_p
-):
-    balance_func.update(Q, m, c, X, budget, kappa, theta, S, p_star)
-    return balance_func.gmres(
-        grad_p,
-        x0=x0,
-        tol=1e-8,
-        atol=0.0,
-        restart=20,
-        maxiter=50,
+    # Backtracking line-search parameters
+    _ls_min_step = 1e-6  # minimal step size alpha before we terminate
+    _ls_max_halves = (
+        None  # None ⇒ unlimited until _ls_min_step, or set an int cap
     )
 
+    # ------------------------------ helpers ------------------------------
 
-class PriceSolver(torch.autograd.Function):
     @staticmethod
-    def forward(
-        Q: torch.Tensor,  # (B, n, n)
-        m: torch.Tensor,  # (B, n)
-        c: torch.Tensor,  # (B, )
-        X: torch.Tensor,  # (B, n)
-        budget: torch.Tensor,  # (B, )
-        kappa: torch.Tensor,  # (B, )
-        theta: torch.Tensor,  # (B, )
-        S: torch.Tensor,  # (n, )
-        p0=None,
+    def _unwrap_single(x):
+        """Accept either a Tensor or a (Tensor,) singleton; raise otherwise."""
+        if isinstance(x, tuple):
+            if len(x) != 1:
+                raise TypeError(
+                    "ImplicitFunction expects `func` to be single-output (Tensor). "
+                    f"Got a tuple of length {len(x)}."
+                )
+            return x[0]
+        return x
+
+    # -------------------- ExplicitADFunction: forward ---------------------
+
+    @classmethod
+    def compute(cls, y_target: torch.Tensor, *inputs: torch.Tensor):
+        """
+        Solve F(*inputs) = y_target for inputs[var_i], where var_i = variable_input - 1.
+
+        Returns the solved variable tensor (same shape as y_target).
+        """
+        if cls.func is None:
+            raise RuntimeError(
+                "ImplicitFunction.func must be set to an ExplicitADFunction+GMRES class."
+            )
+        if not isinstance(cls.variable_input, int):
+            raise TypeError(
+                "ImplicitFunction.variable_input must be a 1-based integer index."
+            )
+        if len(inputs) == 0:
+            raise ValueError("At least one input is required.")
+
+        var_i = cls.variable_input - 1
+        if not (0 <= var_i < len(inputs)):
+            raise IndexError(
+                f"variable_input={cls.variable_input} is out of range "
+                f"for {len(inputs)} inputs."
+            )
+
+        xs = list(inputs)
+        x_var = xs[var_i]
+        if not isinstance(x_var, torch.Tensor):
+            raise TypeError("Variable input must be a Tensor.")
+        # Square local system: shape(x_var) == shape(y)
+        if x_var.shape != y_target.shape:
+            raise ValueError(
+                "Assuming square local system: "
+                "shape(variable input) must equal shape(y_target)."
+            )
+
+        device, dtype = y_target.device, y_target.dtype
+        Func = cls.func  # capture subclass' func for nested classes
+
+        for _ in range(cls._newton_maxiter):
+            # Residual at current iterate
+            y_cur = cls._unwrap_single(Func.compute(*xs))
+            r = y_cur - y_target
+            r_before = torch.linalg.vector_norm(r)
+            if r_before <= torch.as_tensor(
+                cls._newton_tol, device=device, dtype=dtype
+            ):
+                break
+
+            # Linearize at current point and build J_var via JVP
+            primals = Func.compute_primals(*xs, outputs=y_cur)
+            x_shape = x_var.shape
+
+            class _J(GMRESSolver):
+                @classmethod
+                def matvec(cls2, v_flat, primals_):
+                    v = v_flat.view(x_shape)
+                    tangents = tuple(
+                        v if j == var_i else None for j in range(len(xs))
+                    )
+                    Jy = Func.jvp_from_primals(primals_, *tangents)
+                    Jy = ImplicitFunction._unwrap_single(Jy)
+                    return Jy.reshape(-1)
+
+                @classmethod
+                def compute_residual(cls2, b, x, primals_):
+                    return b - cls2.matvec(x, primals_)
+
+            # Solve J Δ = -r
+            dx_flat = _J.gmres(
+                b=(-r).reshape(-1),
+                primals=primals,
+                x0=None,
+                tol=cls._gmres_tol,
+                atol=cls._gmres_atol,
+                restart=cls._gmres_restart,
+                maxiter=cls._gmres_maxiter,
+            )
+            dx = dx_flat.view_as(x_var)
+
+            # Backtracking line search (halve alpha until residual decreases)
+            alpha = torch.tensor(1.0, device=device, dtype=dtype)
+            halved = 0
+            while True:
+                x_trial = x_var + alpha * dx
+                xs_trial = list(xs)
+                xs_trial[var_i] = x_trial
+                y_trial = cls._unwrap_single(Func.compute(*xs_trial))
+                r_after = torch.linalg.vector_norm(y_trial - y_target)
+
+                if r_after <= r_before:  # accept
+                    x_var, xs = x_trial, xs_trial
+                    break
+
+                alpha = alpha * 0.5
+                halved += 1
+                if alpha.item() < cls._ls_min_step or (
+                    cls._ls_max_halves is not None
+                    and halved >= cls._ls_max_halves
+                ):
+                    # terminate: step too small and still not decreasing residual
+                    return x_var
+
+        return x_var
+
+    # ----------------- ExplicitADFunction: cache primals ------------------
+
+    @classmethod
+    def compute_primals(
+        cls,
+        y_target: torch.Tensor,
+        *inputs: torch.Tensor,
+        outputs: torch.Tensor,
     ):
-        if p0 is None:
-            p0 = (m * budget.unsqueeze(-1)).sum(dim=0) / (
-                budget.sum(dim=0) + 1e-4
+        """
+        Prepare and cache primals at the solution point for implicit VJP.
+
+        Arguments match the autograd plumbing:
+          - y_target, *inputs  : the same args passed to .compute(...)
+          - outputs            : the x_var returned by .compute(...)
+        """
+        var_i = cls.variable_input - 1
+        xs_sol = list(inputs)
+        xs_sol[var_i] = outputs.detach()
+
+        y_sol = cls._unwrap_single(cls.func.compute(*xs_sol))
+        primals_F = cls.func.compute_primals(*xs_sol, outputs=y_sol)
+
+        return {
+            "y": y_target.detach(),
+            "inputs_sol": tuple(t.detach() for t in xs_sol),
+            "primals_F": primals_F,
+            "var_i": var_i,
+            "shape_y": y_sol.shape,
+            "shape_xvar": outputs.shape,
+        }
+
+    # ----------------- ExplicitADFunction: implicit VJP -------------------
+
+    @classmethod
+    def vjp_from_primals(
+        cls, saved, bar_xvar: torch.Tensor, needs_input_grad=None
+    ):
+        """
+        Given upstream cotangent on the output (x_var), return gradients wrt
+        (y_target, *inputs) for the implicit map.
+
+        Implicit VJP:
+          1) Solve (∂F/∂x_var)^T w = bar_xvar
+          2) bar_y = w
+          3) bar_inputs[j] = - (∂F/∂x_j)^T w  for j != var_i
+             bar_inputs[var_i] = None   (the initial guess is not a true input to g)
+        """
+        primals_F = saved["primals_F"]
+        var_i = saved["var_i"]
+        shape_y = saved["shape_y"]
+        Func = cls.func
+
+        class _JT(GMRESSolver):
+            @classmethod
+            def matvec(cls2, v_flat, primals_):
+                v_y = v_flat.view(shape_y)
+                # func is assumed single-output: pass one cotangent
+                grads = Func.vjp_from_primals(primals_, v_y)
+                g_var = grads[var_i]  # (∂F/∂x_var)^T v_y
+                return g_var.reshape(-1)
+
+            @classmethod
+            def compute_residual(cls2, b, x, primals_):
+                return b - cls2.matvec(x, primals_)
+
+        # Solve J^T w = bar_xvar
+        w_flat = _JT.gmres(
+            b=bar_xvar.reshape(-1),
+            primals=primals_F,
+            x0=None,
+            tol=cls._gmres_tol,
+            atol=cls._gmres_atol,
+            restart=cls._gmres_restart,
+            maxiter=cls._gmres_maxiter,
+        )
+        w = w_flat.view(shape_y)
+
+        # Gradients w.r.t. inputs via VJP through func at the solution point
+        full_vjp = Func.vjp_from_primals(
+            primals_F, w
+        )  # tuple of length == len(inputs)
+        bar_inputs = [
+            (None if j == var_i else (-g if g is not None else None))
+            for j, g in enumerate(full_vjp)
+        ]
+        bar_y = w
+
+        if needs_input_grad is not None:
+            # needs_input_grad corresponds to (y_target, *inputs)
+            grads_all = (bar_y, *bar_inputs)
+            masked = tuple(
+                g if need else None
+                for g, need in zip(grads_all, needs_input_grad)
             )
-        stock_solver.update(Q, m, c, X, budget, kappa, theta)
-        return newton_krylov(
-            stock_solver,
-            p0,
-            S,
-            tol=1e-8,
-            rtol=1e-8,
-            lstol=1e-6,
-            gmres_restart=10,
-            gmres_maxiter=10,
-            max_outer=40,
-            positive=True,
-            verbose=False,
-        )
+            return masked
 
-    @staticmethod
-    def setup_context(ctx, inputs, output):
-        Q, m, c, X, budget, kappa, theta, S, x0 = inputs
-        if x0 is None:
-            x0 = (m * budget.unsqueeze(-1)).sum(dim=0) / (
-                budget.sum(dim=0) + 1e-4
-            )
-
-        p_star = output
-
-        # Save for backward (VJP path)
-        ctx.save_for_backward(
-            Q,
-            m,
-            c,
-            X,
-            budget,
-            kappa,
-            theta,
-            S,
-            x0,
-            p_star.detach().requires_grad_(True),
-        )
-
-    @staticmethod
-    def backward(ctx, grad_p):
-        Q, m, c, X, budget, kappa, theta, S, x0, p_star = ctx.saved_tensors
-
-        # Solve A v = grad_p with GMRES
-        v = balance_func_gmres(*ctx.saved_tensors, grad_p)
-
-        with torch.enable_grad():
-            F = stock_solver_func(*ctx.saved_tensors)
-
-        input_tuple = tuple(
-            ctx.saved_tensors[i]
-            for i in range(len(ctx.needs_input_grad))
-            if ctx.needs_input_grad[i]
-        )
-        # Compute
-        grad_tuple = torch.autograd.grad(
-            F,
-            input_tuple,
-            grad_outputs=-v,
-            retain_graph=False,
-            allow_unused=True,
-        )
-        gidx = torch.cumsum(torch.tensor(ctx.needs_input_grad), dim=0) - 1
-        return tuple(
-            grad_tuple[gidx[i]] if ctx.needs_input_grad[i] else None
-            for i in range(9)
-        )
+        return (bar_y, *bar_inputs)
 
 
-def compute_initial_prices(Sigma, M, budget, kappa, theta, S, p0=None):
-    return PriceSolver.apply(
-        Sigma,
-        M,
-        torch.zeros_like(budget),
-        torch.zeros_like(M),
-        budget,
-        kappa,
-        theta,
-        S,
-        p0,
-    )
+class PriceSolver(ImplicitFunction):
+    func = StockSolverSum
+    variable_input = 8
 
 
 def _to_float64_preserve_grad(x):
@@ -2054,95 +2593,12 @@ def find_equilibrium_prices(
     theta = _to_float64_preserve_grad(long_leverage)
     S = _to_float64_preserve_grad(supply)
     p0 = (
-        None
+        torch.ones_like(S)
         if initial_approximation is None
         else _to_float64_preserve_grad(initial_approximation)
     )
-
-    return PriceSolver.apply(Sigma, mu, com, X, budget, kappa, theta, S, p0)
-
-
-def optimize_portfolio(
-    Sigma,
-    expected_returns,
-    commission,
-    holdings,
-    budget,
-    short_leverage,
-    long_leverage,
-    prices,
-):
-    """
-    Optimize a single portfolio or a batch of portfolios under budget, short, and long leverage constraints.
-
-    Batching
-    --------
-    Supports single or batched optimization. When batched, **all parameters except `prices` must be
-    stacked along dimension 0** (the batch dimension). **`prices` is a market-wide vector shared by
-    everyone and MUST be unbatched** (shape (N,)); it will be internally broadcast across the batch.
-
-    The method accepts PyTorch tensors or any array-like objects convertible to `torch.Tensor`,
-    and is fully differentiable (autograd-friendly).
-
-    Parameters
-    ----------
-    Sigma : (N, N) or (B, N, N)
-        Expected covariance matrix (PSD). Batched as (B, N, N).
-    expected_returns : (N,) or (B, N)
-        Expected returns. Batched as (B, N).
-    commission : (N,) or (B, N)
-        Per-asset commission to **buy**. Use zeros for initial portfolios.
-    holdings : (N,) or (B, N)
-        Current holdings (shares). Use zeros for initial portfolios.
-    budget : () or (B,)
-        Total budget (scalar or batched scalar).
-    short_leverage : () or (N,) or (B,) or (B, N)
-        Per-security short cap as a fraction of `budget`. `0` ⇒ no short sales.
-    long_leverage : () or (N,) or (B,) or (B, N)
-        Per-security long cap as a fraction of `budget`. Values < 1 ⇒ no leverage.
-    prices : (N,)
-        **Market prices** shared by all agents. **Must be 1-D (N,)**; batches are not allowed.
-
-    Returns
-    -------
-    optimal_holdings : (N,) or (B, N) torch.Tensor
-        Optimal post-trade holdings satisfying constraints.
-
-    Notes
-    -----
-    - `prices` is **unbatched** by design (market-wide).
-    - All other inputs follow the single vs. batched rules above.
-    - Fully differentiable; non-tensors are converted to tensors.
-
-    Examples
-    --------
-    Single portfolio
-    >>> h = optimize_portfolio(Sigma, mu, commission=torch.zeros_like(mu),
-    ...     holdings=torch.zeros_like(mu), budget=1.0,
-    ...     short_leverage=0.0, long_leverage=1.0, prices=prices)
-
-    Batched portfolios (B, N) with shared market prices (N,)
-    >>> h_b = optimize_portfolio(Sigma_b, mu_b, commission_b, holdings_b,
-    ...     budget_b, short_leverage=0.0, long_leverage=1.0, prices=prices)
-    """    
-    if Sigma.ndim == 2:
-        ssolv = StockSolver(
-            torch.as_tensor(Sigma, dtype=torch.float64).unsqueeze(0),
-            torch.as_tensor(expected_returns, dtype=torch.float64).unsqueeze(0),
-            torch.as_tensor(commission, dtype=torch.float64).unsqueeze(0),
-            torch.as_tensor(holdings, dtype=torch.float64).unsqueeze(0),
-            torch.as_tensor(budget, dtype=torch.float64).unsqueeze(0),
-            torch.as_tensor(short_leverage, dtype=torch.float64).unsqueeze(0),
-            torch.as_tensor(long_leverage, dtype=torch.float64).unsqueeze(0),
-        )        
-    else:
-        ssolv = StockSolver(
-            torch.as_tensor(Sigma, dtype=torch.float64),
-            torch.as_tensor(expected_returns, dtype=torch.float64),
-            torch.as_tensor(commission, dtype=torch.float64),
-            torch.as_tensor(holdings, dtype=torch.float64),
-            torch.as_tensor(budget, dtype=torch.float64),
-            torch.as_tensor(short_leverage, dtype=torch.float64),
-            torch.as_tensor(long_leverage, dtype=torch.float64),
-        )
-    return ssolv(torch.as_tensor(prices, dtype=torch.float64))
+    x0 = torch.zeros_like(mu)
+    # y_target is supply; inputs contain the *initial* prices in the variable slot
+    return PriceSolver.apply(
+        S, Sigma, mu, com, X, budget, kappa, theta, p0, x0
+    )
