@@ -233,3 +233,6 @@ class TestExplicitADFunction(unittest.TestCase):
         self.assertTrue(
             torch.allclose(x.grad, torch.tensor(2 * 2.0 * 3.0))
         )  # d(x^2)*3 = 2x*3
+
+if __name__ == "__main__":
+    unittest.main()
