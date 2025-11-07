@@ -12,9 +12,10 @@ _core = importlib.import_module("heteromarket.core")
 GMRESSolver = _core.GMRESSolver
 bdot = _core.bdot
 
+dummy_primals = torch.tensor(0)
 
 def find_start_point(wl, wh, L, U, p):
-    denom = ActiveSetQPFunc.batched_dot(p, U).clamp_min(1e-30)
+    denom = bdot(p, U).clamp_min(1e-30)
     x0 = torch.where(
         wl.unsqueeze(-1) < 0.0,
         torch.zeros_like(p),
@@ -23,39 +24,25 @@ def find_start_point(wl, wh, L, U, p):
     return x0
 
 class SimpleFunc:
-    def __init__(self):
-        pass
-
-    def set(self, A, M=None):
-        self.A = A.clone().detach()
-        if M is None:
-            self.M = torch.eye(A.shape[0])
-        else:
-            self.M = M.clone().detach()
-
-    def linearize(x0):
-        # Not needed fo linear function
-        pass
-
-    def forward_jvp(self, x):
+    @classmethod
+    def matvec(cls, x, primals):
         return x
-        
-    def matvec(self, x):
-        return self.forward_jvp(x)
-    
-    def compute_residual(self, b, x):
+
+    @classmethod
+    def compute_residual(cls, b, x, primals):
         return b - x
 
 
 class LinearFunc(SimpleFunc):
-    def forward_jvp(self, x):
-        return self.M @ (self.A @ x)
-    
-    def matvec(self, x):
-        return self.forward_jvp(x)
-        
-    def compute_residual(self, b, x):
-        return self.M @ (b - self.A @ x)
+    @classmethod
+    def matvec(self, x, primals):
+        A, M = primals
+        return M @ (A @ x)
+
+    @classmethod
+    def compute_residual(self, b, x, primals):
+        A, M = primals
+        return M @ (b - A @ x)
 
 
 class SimpleFuncGMRES(SimpleFunc, GMRESSolver):
@@ -333,14 +320,14 @@ class TestKthArnoldiIteration(unittest.TestCase):
 
         # Run function under test (tensor k)
         k_t = torch.tensor(k, dtype=torch.int64, device=device)
-        self.func.set(f_state, M)
+        primals = (f_state, M)
         V_out, H_out, breakdown = self.func._kth_arnoldi_iteration(
-            k_t, V_init.clone(), H_init.clone()
+            k_t, V_init.clone(), H_init.clone(), primals
         )
 
         # Manual expectation
         v_k = V_init[:, k]
-        w = self.func.forward_jvp(v_k)
+        w = self.func.matvec(v_k, primals)
         # Build two-pass CGS against used columns 0..k
         V_used = V_init[:, : k + 1]
         r_used, q2 = twopass_cgs(V_used, w)  # r_used length k+1, q2 unnormalized
@@ -417,9 +404,9 @@ class TestKthArnoldiIteration(unittest.TestCase):
                 M = torch.eye(m, dtype=dtype)
 
                 # Here w = M @ A(v_k) = v_k, which lies in span(V[:, :k+1]).
-                self.func.set(dummy_state, M)
+                primals = (dummy_state, M)
                 V_out, H_out, breakdown = self.func._kth_arnoldi_iteration(
-                    torch.tensor(k, dtype=torch.int64), V.clone(), H.clone()
+                    torch.tensor(k, dtype=torch.int64), V.clone(), H.clone(), primals
                 )
                 # Expected: new column is zero, breakdown True
                 self.assertTrue(
@@ -445,9 +432,9 @@ class TestKthArnoldiIteration(unittest.TestCase):
                 dummy_state = torch.tensor(0)
                 M = torch.eye(m, dtype=dtype)
 
-                self.func.set(dummy_state, M)
+                primals = (dummy_state, M)
                 V_out, H_out, breakdown = self.func._kth_arnoldi_iteration(
-                    torch.tensor(k, dtype=torch.int64), V, H
+                    torch.tensor(k, dtype=torch.int64), V, H, primals
                 )
 
                 self.assertEqual(V_out.dtype, dtype)
@@ -481,8 +468,8 @@ class TestGMRESBatched(unittest.TestCase):
         )
 
     def _prep_initial_residual(self, f_state, M, b, x0):
-        self.func.set(f_state, M)
-        r0 = self.func.compute_residual(b, x0)
+        primals = (f_state, M)
+        r0 = self.func.compute_residual(b, x0, primals)
         unit_residual, residual_norm = _normalize_like_impl(r0)
         return unit_residual, residual_norm
 
@@ -498,10 +485,10 @@ class TestGMRESBatched(unittest.TestCase):
 
                 unit_residual, residual_norm = self._prep_initial_residual(I, M, b, x0)
 
-                self.func.set(I, M)
+                primals = (I, M)
                 # Any restart >= 1 should solve exactly in one step
                 x, ures, rnorm = self.func._gmres_batched(
-                    b, x0, unit_residual, residual_norm, restart=3
+                    b, x0, unit_residual, residual_norm, 3, primals
                 )
 
                 # Expect x == b (A = I), residual zero
@@ -524,11 +511,11 @@ class TestGMRESBatched(unittest.TestCase):
                 x_star = torch.linalg.solve(D, b)  # true solution
                 x0 = torch.randn(m, dtype=dtype)
 
-                self.func.set(D, M)
+                primals = (D, M)
                 unit_residual, residual_norm = self._prep_initial_residual(D, M, b, x0)
 
                 x, ures, rnorm = self.func._gmres_batched(
-                    b, x0, unit_residual, residual_norm, restart=1
+                    b, x0, unit_residual, residual_norm, 1, primals
                 )
 
                 self.assertAllClose(x, x_star, dtype)
@@ -552,15 +539,15 @@ class TestGMRESBatched(unittest.TestCase):
                     A_mat, M, b, x0
                 )
 
-                self.func.set(A_mat, M)
+                primals = (A_mat, M)
                 # restart >= m should produce the exact solve (up to fp error)
                 x, ures, rnorm = self.func._gmres_batched(
-                    b, x0, unit_residual, residual_norm, restart=m
+                    b, x0, unit_residual, residual_norm, m, primals
                 )
 
                 # Check solution and residual
                 self.assertAllClose(x, x_true, dtype)
-                res = self.func.compute_residual(b, x)
+                res = self.func.compute_residual(b, x, primals)
                 self.assertTrue(
                     torch.allclose(
                         res,
@@ -587,12 +574,12 @@ class TestGMRESBatched(unittest.TestCase):
 
                 unit_residual, residual_norm = self._prep_initial_residual(D, M, b, x0)
 
-                self.func.set(D, M)
+                primals = (D, M)
                 x1, _, _ = self.func._gmres_batched(
-                    b, x0, unit_residual, residual_norm, restart=1
+                    b, x0, unit_residual, residual_norm, 1, primals
                 )
                 x3, _, _ = self.func._gmres_batched(
-                    b, x0, unit_residual, residual_norm, restart=3
+                    b, x0, unit_residual, residual_norm, 3, primals
                 )
 
                 self.assertAllClose(x1, x3, dtype)
@@ -607,8 +594,8 @@ class TestGMRESBatched(unittest.TestCase):
                 M = torch.eye(m, dtype=dtype)
 
                 x_true = torch.randn(m, dtype=dtype)
-                self.func.set(A_mat, M)
-                b = self.func.forward_jvp(x_true)
+                primals = (A_mat, M)
+                b = self.func.matvec(x_true, primals)
                 x0 = x_true.clone()  # start at the solution
 
                 unit_residual, residual_norm = self._prep_initial_residual(
@@ -621,9 +608,9 @@ class TestGMRESBatched(unittest.TestCase):
                     torch.allclose(unit_residual, torch.zeros_like(unit_residual))
                 )
 
-                self.func.set(A_mat, M)
+                primals = (A_mat, M)
                 x, ures, rnorm = self.func._gmres_batched(
-                    b, x0, unit_residual, residual_norm, restart=4
+                    b, x0, unit_residual, residual_norm, 4, primals
                 )
 
                 self.assertAllClose(x, x0, dtype)
@@ -644,9 +631,9 @@ class TestGMRESBatched(unittest.TestCase):
                     A_mat, M, b, x0
                 )
 
-                self.func.set(A_mat, M)
+                primals = (A_mat, M)
                 x, ures, rnorm = self.func._gmres_batched(
-                    b, x0, unit_residual, residual_norm, restart=restart
+                    b, x0, unit_residual, residual_norm, restart, primals
                 )
 
                 self.assertEqual(x.dtype, dtype)
@@ -695,9 +682,10 @@ class TestGMRESvsJAX(unittest.TestCase):
         else:
             M_t = torch.tensor(M_mat_np, dtype=dtype)
 
-        self.func.set(A_t, M_t)
+        primals = (A_t, M_t)
         x_t = self.func.gmres(
             b_t,
+            primals,
             x0=x0_t,
             tol=1e-6,
             atol=0.0,
@@ -753,7 +741,10 @@ class TestGMRESvsJAX(unittest.TestCase):
                 self.assertAllCloseJnp(x_j, b_np, dtype)
 
                 # Residuals should be zero (within fp)
-                r_t = self.func.compute_residual(b_t, x_t)
+                A_t = torch.tensor(A_np, dtype=dtype)
+                M_t = torch.eye(A_np.shape[0], dtype=dtype)
+                primals = (A_t, M_t)
+                r_t = self.func.compute_residual(b_t, x_t,primals)
                 self.assertAllCloseTorch(
                     torch.linalg.vector_norm(r_t), torch.tensor(0.0, dtype=dtype), dtype
                 )
@@ -787,7 +778,10 @@ class TestGMRESvsJAX(unittest.TestCase):
                 self.assertAllCloseJnp(x_j, x_true, dtype)
 
                 # Residuals near zero
-                rt = self.func.compute_residual(b_t, x_t)
+                A_t = torch.tensor(A_np, dtype=dtype)
+                M_t = torch.eye(A_np.shape[0], dtype=dtype)
+                primals = (A_t, M_t)
+                rt = self.func.compute_residual(b_t, x_t, primals)
                 self.assertAllCloseTorch(
                     torch.linalg.vector_norm(rt), torch.tensor(0.0, dtype=dtype), dtype
                 )
@@ -841,15 +835,10 @@ class TestGMRESvsJAX(unittest.TestCase):
                 self.assertAllCloseJnp(x_j, x_true, dtype)
 
                 # Residuals zero
-                rt = self.func.compute_residual(b_t, x_t)
+                A_t = torch.tensor(A_np, dtype=dtype)
+                M_t = torch.tensor(M_np, dtype=dtype)
+                primals = (A_t, M_t)
+                rt = self.func.compute_residual(b_t, x_t, primals)
                 self.assertAllCloseTorch(
                     torch.linalg.vector_norm(rt), torch.tensor(0.0, dtype=dtype), dtype
                 )
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
-
-
