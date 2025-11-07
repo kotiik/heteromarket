@@ -4,7 +4,7 @@ import torch
 from torch.autograd.functional import jvp
 
 _core = importlib.import_module("heteromarket.core")
-StockSolver = _core.StockSolver
+StockSolverFunc = _core.StockSolverFunc
 
 class TestActiveSetQPSolverInit(unittest.TestCase):
     @staticmethod
