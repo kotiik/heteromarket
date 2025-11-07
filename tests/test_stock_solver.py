@@ -10,6 +10,7 @@ from torch import Tensor
 
 _core = importlib.import_module("heteromarket.core")
 StockSolverFunc = _core.StockSolverFunc
+ActiveSetQPFunc = _core.ActiveSetQPFunc
 bdot = _core.bdot
 
 class TestActiveSetQPSolverInit(unittest.TestCase):
