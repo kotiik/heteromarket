@@ -117,3 +117,7 @@ class TestStockSolverSumBasic(unittest.TestCase):
         self.assertEqual(tuple(dy.shape), (self.n,))
         self.assertTrue(torch.isfinite(y0).all())
         self.assertTrue(torch.isfinite(dy).all())
+
+
+if __name__ == "__main__":
+    unittest.main()
