@@ -2,6 +2,7 @@ import importlib
 import unittest
 import torch
 import numpy as np
+from scipy import stats
 from torch.autograd.functional import jvp
 
 _core = importlib.import_module("heteromarket.core")
