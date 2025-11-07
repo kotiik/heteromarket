@@ -1688,3 +1688,6 @@ class TestQPStockSoverGrad(unittest.TestCase):
                     msg=f"Gradient mismatch for {name}"
                 )
 
+
+if __name__ == "__main__":
+    unittest.main()
