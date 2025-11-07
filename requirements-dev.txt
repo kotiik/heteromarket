@@ -2,6 +2,8 @@ numpy
 torch
 jax
 cvxpy
+numpy
+scikit-learn
 coverage        # test coverage
 ruff            # lint
 mypy            # type checking (if you add hints)
