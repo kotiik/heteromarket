@@ -3,11 +3,14 @@ import unittest
 import torch
 from torch.autograd.forward_ad import dual_level, make_dual, unpack_dual
 from torch.autograd import grad
+from scipy import stats
+import cvxpy as cp
+from sklearn.metrics import r2_score
+import random
 
 _core = importlib.import_module("heteromarket.core")
 ActiveSetQPFunc = _core.ActiveSetQPFunc
 bdot = _core.bdot
-
 
 def find_start_point(wl, wh, L, U, p):
     denom = bdot(p, U).clamp_min(1e-30)
@@ -1517,7 +1520,3 @@ class TestJVPMethod(unittest.TestCase):
         U1 = torch.tensor([2060.69218141, 2064.8856702, 2064.72872755]).unsqueeze(0)
         x0 = find_start_point(wl1, wh1, L1, U1, p1)
         self.check_jvp(Q1, m1, c, wl1, wh1, L1, U1, p1, x0)
-
-
-if __name__ == "__main__":
-    unittest.main()
