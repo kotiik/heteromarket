@@ -4,9 +4,11 @@ import torch
 import numpy as np
 from scipy import stats
 from torch.autograd.functional import jvp
+import itertools
 
 _core = importlib.import_module("heteromarket.core")
 StockSolverFunc = _core.StockSolverFunc
+bdot = _core.bdot
 
 class TestActiveSetQPSolverInit(unittest.TestCase):
     @staticmethod
