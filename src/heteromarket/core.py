@@ -1714,23 +1714,23 @@ class GMRESSolver:
         raise NotImplementedError
 
     @staticmethod
-    def _safe_normalize(x: torch.Tensor, thresh: float | None = None):
+    def _safe_normalize(x: torch.Tensor):
         """
         L2-normalize x; if ||x|| <= thresh, return (0 vector, 0).
         """
-        if thresh is None:
-            thresh = torch.finfo(x.dtype).eps
+        thresh = torch.finfo(x.dtype).eps
+        thresh_t = torch.as_tensor(thresh, dtype=x.dtype, device=x.device)
+        return GMRESSolver._safe_normalize_thresh(x, thresh_t)
 
+    @staticmethod
+    def _safe_normalize_thresh(x: torch.Tensor, thresh: torch.Tensor):
         norm = torch.linalg.vector_norm(x)  # scalar tensor
-        thresh_t = torch.as_tensor(
-            thresh, dtype=norm.dtype, device=norm.device
-        )
 
         # Avoid div-by-zero by clamping the denominator
-        safe_norm = torch.clamp(norm, min=thresh_t)
+        safe_norm = torch.clamp(norm, min=thresh)
 
         y = x / safe_norm  # well-defined
-        use = norm > thresh_t
+        use = norm > thresh
 
         y = torch.where(use, y, torch.zeros_like(x))
         norm_out = torch.where(use, norm, norm.new_zeros(()))
@@ -1793,7 +1793,7 @@ class GMRESSolver:
             torch.as_tensor(torch.finfo(dtype).eps, dtype=dtype, device=device)
             * w_norm0
         )
-        unit_v, v_norm_1 = GMRESSolver._safe_normalize(q, thresh=tol)
+        unit_v, v_norm_1 = GMRESSolver._safe_normalize_thresh(q, tol)
 
         # Write V[:, k+1] with a one-hot mask (no Python indexing)
         e_kp1 = functional.one_hot(
