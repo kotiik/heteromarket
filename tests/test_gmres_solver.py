@@ -8,7 +8,7 @@ from jax import numpy as jnp
 from jax.scipy.sparse.linalg import gmres as jax_gmres
 
 _core = importlib.import_module("heteromarket.core")
-GMRESSolver = _core.GMRESSolver
+StockSolverSum = _core.StockSolverSum
 bdot = _core.bdot
 
 dummy_primals = torch.tensor(0)
