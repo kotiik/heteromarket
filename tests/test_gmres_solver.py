@@ -96,7 +96,7 @@ class TestSafeNormalize(unittest.TestCase):
 
     def test_custom_threshold_forces_zero(self):
         x = torch.tensor([1e-8, -1e-8], dtype=torch.float32)
-        y, n = GMRESSolver._safe_normalize(x, thresh=1e-7)  # ||x|| ≈ 1.414e-8 < thresh
+        y, n = GMRESSolver._safe_normalize_thresh(x, torch.tensor(1e-7))  # ||x|| ≈ 1.414e-8 < thresh
         self.assertTrue(torch.allclose(y, torch.zeros_like(x)))
         self.assertEqual(n.item(), 0.0)
 
@@ -106,9 +106,10 @@ class TestSafeNormalize(unittest.TestCase):
             (torch.float64, 1e-12, 1e-13, 1e-12),
         ]
         for dtype, val, thresh, atol in cases:
+            thresh_t = torch.tensor(thresh)
             with self.subTest(dtype=dtype):
                 x = torch.tensor([val, 0.0, -val], dtype=dtype)
-                y, n = GMRESSolver._safe_normalize(x, thresh=thresh)
+                y, n = GMRESSolver._safe_normalize_thresh(x, thresh_t)
                 self.assertGreater(n.item(), thresh)
                 self.assertTrue(
                     torch.allclose(
