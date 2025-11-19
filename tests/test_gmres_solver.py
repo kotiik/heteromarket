@@ -7,7 +7,6 @@ import jax
 from jax import numpy as jnp
 from jax.scipy.sparse.linalg import gmres as jax_gmres
 
-
 _core = importlib.import_module("heteromarket.core")
 GMRESSolver = _core.GMRESSolver
 bdot = _core.bdot
@@ -45,11 +44,11 @@ class LinearFunc(SimpleFunc):
         return M @ (b - A @ x)
 
 
-class SimpleFuncGMRES(SimpleFunc, GMRESSolver):
+class SimpleFuncGMRES(SimpleFunc, StockSolverSum):
     pass
 
 
-class LinearFuncGMRES(LinearFunc, GMRESSolver):
+class LinearFuncGMRES(LinearFunc, StockSolverSum):
     pass
 
 class TestSafeNormalize(unittest.TestCase):
@@ -60,7 +59,7 @@ class TestSafeNormalize(unittest.TestCase):
         for dtype in (torch.float32, torch.float64):
             with self.subTest(dtype=dtype):
                 x = torch.zeros(7, dtype=dtype)
-                y, n = GMRESSolver._safe_normalize(x)
+                y, n = StockSolverSum._safe_normalize(x)
                 self.assertEqual(y.shape, x.shape)
                 self.assertEqual(n.shape, torch.Size(()))  # scalar tensor
                 self.assertTrue(torch.allclose(y, torch.zeros_like(x)))
@@ -72,7 +71,7 @@ class TestSafeNormalize(unittest.TestCase):
         for dtype in (torch.float32, torch.float64):
             with self.subTest(dtype=dtype):
                 x = torch.tensor([3.0, 4.0], dtype=dtype)
-                y, n = GMRESSolver._safe_normalize(x)
+                y, n = StockSolverSum._safe_normalize(x)
                 self.assertTrue(torch.allclose(n, torch.tensor(5.0, dtype=dtype)))
                 atol = 1e-6 if dtype == torch.float32 else 1e-12
                 self.assertTrue(
@@ -89,14 +88,14 @@ class TestSafeNormalize(unittest.TestCase):
         for dtype in (torch.float32, torch.float64):
             with self.subTest(dtype=dtype):
                 x = torch.tensor([1.0, 0.0, 0.0], dtype=dtype)
-                y, n = GMRESSolver._safe_normalize(x)
+                y, n = StockSolverSum._safe_normalize(x)
                 atol = 1e-7 if dtype == torch.float32 else 1e-12
                 self.assertTrue(torch.allclose(y, x, atol=atol, rtol=0))
                 self.assertEqual(n.item(), 1.0)
 
     def test_custom_threshold_forces_zero(self):
         x = torch.tensor([1e-8, -1e-8], dtype=torch.float32)
-        y, n = GMRESSolver._safe_normalize_thresh(x, torch.tensor(1e-7))  # ||x|| ≈ 1.414e-8 < thresh
+        y, n = StockSolverSum._safe_normalize_thresh(x, torch.tensor(1e-7))  # ||x|| ≈ 1.414e-8 < thresh
         self.assertTrue(torch.allclose(y, torch.zeros_like(x)))
         self.assertEqual(n.item(), 0.0)
 
@@ -109,7 +108,7 @@ class TestSafeNormalize(unittest.TestCase):
             thresh_t = torch.tensor(thresh)
             with self.subTest(dtype=dtype):
                 x = torch.tensor([val, 0.0, -val], dtype=dtype)
-                y, n = GMRESSolver._safe_normalize_thresh(x, thresh_t)
+                y, n = StockSolverSum._safe_normalize_thresh(x, thresh_t)
                 self.assertGreater(n.item(), thresh)
                 self.assertTrue(
                     torch.allclose(
@@ -127,7 +126,7 @@ class TestSafeNormalize(unittest.TestCase):
                 eps = torch.finfo(dtype).eps
                 # ||x|| = sqrt(3)*(eps/2) < eps -> should zero out
                 x = torch.full((3,), eps / 2, dtype=dtype)
-                y, n = GMRESSolver._safe_normalize(x)
+                y, n = StockSolverSum._safe_normalize(x)
                 self.assertTrue(torch.allclose(y, torch.zeros_like(x)))
                 self.assertEqual(n.item(), 0.0)
 
@@ -176,7 +175,7 @@ class TestIterativeCGSUnnormalized(unittest.TestCase):
                 Q = torch.empty((m, 0), dtype=dtype)
                 x = torch.randn(m, dtype=dtype)
                 xnorm = torch.linalg.vector_norm(x)
-                q, r = GMRESSolver._iterative_classical_gram_schmidt(Q, x)
+                q, r = StockSolverSum._iterative_classical_gram_schmidt(Q, x)
                 self.assertEqual(r.numel(), 0)
                 # q should equal x (unnormalized, since no columns to remove)
                 self.assertAllClose(q, x, dtype)
@@ -188,7 +187,7 @@ class TestIterativeCGSUnnormalized(unittest.TestCase):
                 Q = orthonormal_columns(m, k, dtype=dtype)
                 x = torch.randn(m, dtype=dtype)
                 xnorm = torch.linalg.vector_norm(x)
-                q, r = GMRESSolver._iterative_classical_gram_schmidt(Q, x)
+                q, r = StockSolverSum._iterative_classical_gram_schmidt(Q, x)
 
                 # Orthogonality: Q^T q ≈ 0
                 ortho = Q.T @ q
@@ -212,7 +211,7 @@ class TestIterativeCGSUnnormalized(unittest.TestCase):
                 Q = orthonormal_columns(m, k, dtype=dtype)
                 x = torch.randn(m, dtype=dtype)
                 xnorm = torch.linalg.vector_norm(x)
-                q, r = GMRESSolver._iterative_classical_gram_schmidt(Q, x)
+                q, r = StockSolverSum._iterative_classical_gram_schmidt(Q, x)
                 r_true = Q.T @ x
                 self.assertTrue(
                     torch.allclose(
@@ -228,7 +227,7 @@ class TestIterativeCGSUnnormalized(unittest.TestCase):
                 coeffs = torch.randn(k, dtype=dtype)
                 x = Q @ coeffs
                 xnorm = torch.linalg.vector_norm(x)
-                q, r = GMRESSolver._iterative_classical_gram_schmidt(Q, x)
+                q, r = StockSolverSum._iterative_classical_gram_schmidt(Q, x)
                 # q ~ 0, r ~ coeffs
                 self.assertTrue(
                     torch.allclose(
@@ -257,8 +256,8 @@ class TestIterativeCGSUnnormalized(unittest.TestCase):
                 x = Q @ c + small
                 xnorm = torch.linalg.vector_norm(x)
 
-                q1, r1 = GMRESSolver._iterative_classical_gram_schmidt(Q, x)
-                q3, r3 = GMRESSolver._iterative_classical_gram_schmidt(Q, x)
+                q1, r1 = StockSolverSum._iterative_classical_gram_schmidt(Q, x)
+                q3, r3 = StockSolverSum._iterative_classical_gram_schmidt(Q, x)
 
                 # r should be very close; q should point in (nearly) the same direction
                 self.assertTrue(
@@ -275,7 +274,7 @@ class TestIterativeCGSUnnormalized(unittest.TestCase):
                 Q = orthonormal_columns(m, k, dtype=dtype)
                 x = torch.randn(m, dtype=dtype)
                 xnorm = torch.linalg.vector_norm(x)
-                q, r = GMRESSolver._iterative_classical_gram_schmidt(Q, x)
+                q, r = StockSolverSum._iterative_classical_gram_schmidt(Q, x)
                 self.assertEqual(q.dtype, dtype)
                 self.assertEqual(r.dtype, dtype)
                 self.assertEqual(q.shape, (m,))
