@@ -2091,7 +2091,7 @@ def optimize_portfolio(
             _to_float64_preserve_grad(Sigma).unsqueeze(0),
             _to_float64_preserve_grad(expected_returns).unsqueeze(0),
             _to_float64_preserve_grad(commission).unsqueeze(0),
-            _to_float64_preserve_grad(holding).unsqueeze(0),
+            _to_float64_preserve_grad(holdings).unsqueeze(0),
             _to_float64_preserve_grad(budget).unsqueeze(0),
             _to_float64_preserve_grad(short_leverage).unsqueeze(0),
             _to_float64_preserve_grad(long_leverage).unsqueeze(0),
