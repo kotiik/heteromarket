@@ -4,7 +4,7 @@ import torch
 
 _core = importlib.import_module("heteromarket.core")
 ExplicitADFunction = _core.ExplicitADFunction
-GMRESSolver = _core.GMRESSolver
+StockSolverSum = _core.StockSolverSum
 ImplicitFunction = _core.ImplicitFunction
 
 # -------- Concrete F and its GMRES wrapper used in tests --------
@@ -37,7 +37,7 @@ class MyFunction(ExplicitADFunction):
         return 2 * x1 * dx1 + 3 * dx2
 
 
-class MyFunctionGMRES(MyFunction, GMRESSolver):
+class MyFunctionGMRES(MyFunction, StockSolverSum):
     @classmethod
     def matvec(cls, x, primals):
         # compute J_x1 @ x via JVP: dx1=x, dx2=None
@@ -205,7 +205,7 @@ class Bratu1DF(torch.autograd.Function):
 
 
 # ---- GMRES-enabled Bratu function ----
-class Bratu1DGMRES(Bratu1DF, GMRESSolver):
+class Bratu1DGMRES(Bratu1DF, StockSolverSum):
     @classmethod
     def matvec(cls, x, primals):
         # single-input function: dx tangent is x
@@ -219,7 +219,7 @@ class Bratu1DGMRES(Bratu1DF, GMRESSolver):
     def gmres(
         cls, b, primals, x0=None, tol=1e-6, atol=0.0, restart=20, maxiter=None
     ):
-        # call your GMRES implementation; this stub assumes it's in GMRESSolver
+        # call your GMRES implementation; this stub assumes it's in StockSolverSum
         return super().gmres(
             b=b,
             primals=primals,
@@ -332,7 +332,7 @@ class ExtendedRosenbrockF(ExplicitADFunction):
 
 
 # ---------- GMRES wrapper for Extended Rosenbrock ----------
-class ExtendedRosenbrockGMRES(ExtendedRosenbrockF, GMRESSolver):
+class ExtendedRosenbrockGMRES(ExtendedRosenbrockF, StockSolverSum):
     @classmethod
     def matvec(cls, x, primals):
         # single-input function: dx tangent is x
@@ -449,7 +449,7 @@ class Lorenz96F(ExplicitADFunction):
 
 
 # ---------- GMRES wrapper for Lorenz–96 ----------
-class Lorenz96GMRES(Lorenz96F, GMRESSolver):
+class Lorenz96GMRES(Lorenz96F, StockSolverSum):
     @classmethod
     def matvec(cls, x, primals):
         # Single-input function: tangent dx is x
