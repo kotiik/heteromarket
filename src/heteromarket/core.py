@@ -1805,316 +1805,7 @@ def optimize_portfolio(
         )
 
 
-class GMRESSolver:
-    @classmethod
-    def matvec(cls, x, primals):
-        raise NotImplementedError
-
-    @classmethod
-    def compute_residual(cls, b, x, primals):
-        raise NotImplementedError
-
-    @staticmethod
-    def _safe_normalize(x: torch.Tensor):
-        """
-        L2-normalize x; if ||x|| <= thresh, return (0 vector, 0).
-        """
-        thresh = torch.finfo(x.dtype).eps
-        thresh_t = torch.as_tensor(thresh, dtype=x.dtype, device=x.device)
-        return GMRESSolver._safe_normalize_thresh(x, thresh_t)
-
-    @staticmethod
-    def _safe_normalize_thresh(x: torch.Tensor, thresh: torch.Tensor):
-        norm = torch.linalg.vector_norm(x)  # scalar tensor
-
-        # Avoid div-by-zero by clamping the denominator
-        safe_norm = torch.clamp(norm, min=thresh)
-
-        y = x / safe_norm  # well-defined
-        use = norm > thresh
-
-        y = torch.where(use, y, torch.zeros_like(x))
-        norm_out = torch.where(use, norm, norm.new_zeros(()))
-
-        return y, norm_out
-
-    @staticmethod
-    def _iterative_classical_gram_schmidt(
-        Q: torch.Tensor,
-        x: torch.Tensor,
-    ):
-        """
-        Classical GS with optional re-orth (\"twice is enough\").
-        Returns (q_unit, r) where q_unit ⟂ cols(Q).
-        """
-        m, k = Q.shape
-        assert x.shape == (m,)
-
-        # First orthogonalization
-        r0 = x @ Q
-        q0 = x - (Q @ r0)  # (m,)
-        # Second orthogonalization
-        h1 = q0 @ Q
-        r1 = r0 + h1
-        q1 = q0 - (Q @ h1)
-        # Final orthogonalization
-        h = q1 @ Q
-        r = r1 + h
-        q = q1 - (Q @ h)
-        return q, r
-
-    @classmethod
-    def _kth_arnoldi_iteration(
-        cls,
-        k: torch.Tensor,  # scalar int tensor
-        V: torch.Tensor,  # (m, restart+1)
-        H: torch.Tensor,  # (restart, restart+1)
-        primals,  # tuple
-    ):
-        device, dtype = V.device, V.dtype
-        m, ncols = V.shape
-        restart = H.shape[0]  # ncols == restart+1
-
-        # Select v_k without Python ints
-        e_k = functional.one_hot(k.to(torch.int64), num_classes=ncols).to(
-            dtype=dtype, device=device
-        )  # (ncols,)
-        v_k = V @ e_k  # (m,)
-
-        # Arnoldi “apply, orthogonalize”
-        w = cls.matvec(v_k, primals)
-        _, w_norm0 = GMRESSolver._safe_normalize(w)
-
-        # Project against ALL columns in V (unused ones are zeros, so harmless)
-        q, r = GMRESSolver._iterative_classical_gram_schmidt(
-            V, w
-        )  # r: (ncols,)
-
-        tol = (
-            torch.as_tensor(torch.finfo(dtype).eps, dtype=dtype, device=device)
-            * w_norm0
-        )
-        unit_v, v_norm_1 = GMRESSolver._safe_normalize_thresh(q, tol)
-
-        # Write V[:, k+1] with a one-hot mask (no Python indexing)
-        e_kp1 = functional.one_hot(
-            (k + 1).to(torch.int64), num_classes=ncols
-        ).to(
-            dtype=dtype, device=device
-        )  # (ncols,)
-        V_new = V * (1 - e_kp1).unsqueeze(0) + unit_v.unsqueeze(
-            1
-        ) * e_kp1.unsqueeze(
-            0
-        )  # (m, ncols)
-
-        # Build H row k: [r_0..r_k, v_norm_1, 0..]
-        # Set position k+1 to v_norm_1 using one-hot overwrite trick
-        h_full = r + e_kp1 * (v_norm_1 - (r * e_kp1).sum())  # (ncols,)
-
-        row_mask = (
-            functional.one_hot(k.to(torch.int64), num_classes=restart)
-            .to(dtype=dtype, device=device)
-            .unsqueeze(1)
-        )  # (restart,1)
-        H_new = H * (1 - row_mask) + h_full.unsqueeze(0) * row_mask
-
-        breakdown = v_norm_1 == 0
-        return V_new, H_new, breakdown
-
-    @staticmethod
-    def _loop_cond(V, H, breakdown, k, restart, *_):
-        return (k < restart) & (~breakdown)
-
-    @classmethod
-    def _arnoldi_process(cls, V, H, breakdown, k, restart, *primals):
-        V2, H2, breakdown2 = cls._kth_arnoldi_iteration(k, V, H, primals)
-        return V2, H2, breakdown2, k + 1
-
-    @classmethod
-    def _gmres_batched(
-        cls, b, x0, unit_residual, residual_norm, restart: int, primals
-    ):
-        device, dtype = b.device, b.dtype
-        m = b.shape[0]
-        ncols = restart + 1
-        # func_wrapper.set_function(f)
-
-        # V: (m, restart+1); first column = unit_residual
-        V0 = torch.zeros((m, ncols), dtype=dtype, device=device)
-        V0[:, 0] = unit_residual
-
-        # H: (restart, restart+1)
-        H0 = torch.zeros((restart, ncols), dtype=dtype, device=device)
-
-        # If no steps requested, skip the while_loop to avoid zero-iteration aliasing
-        k0 = torch.tensor(0, dtype=torch.int64, device=device)
-        br0 = torch.tensor(False, dtype=torch.bool, device=device)
-
-        V, H, _, k = ops.higher_order.while_loop(
-            GMRESSolver._loop_cond,
-            cls._arnoldi_process,
-            (V0, H0, br0, k0),
-            (restart,) + primals,
-        )
-        # Solve least squares: (Hj^T) y ≈ beta * e1   with Hj = H[:j, :j+1]
-        # Fixed-shape LS: solve min || H^T y - beta e1 ||
-        # Build masked, fixed-size matrix A_ls (no Python slicing by k)
-        ncols = H.shape[1]  # restart + 1
-        idx_r = torch.arange(H.shape[0], device=H.device)  # 0..restart-1
-        idx_c = torch.arange(ncols, device=H.device)  # 0..restart
-        row_mask = (idx_c <= k).to(H.dtype)  # keep rows 0..k in H^T
-        y_mask = (idx_r < k).to(H.dtype)  # unknowns y[0..k-1]
-
-        Ht = H.transpose(0, 1)  # (ncols, restart)
-        A_ls = Ht * y_mask.unsqueeze(0)  # zero inactive columns
-        A_ls = A_ls * row_mask.unsqueeze(1)  # zero rows beyond k
-
-        beta = torch.zeros(ncols, dtype=H.dtype, device=H.device)
-        beta[0] = residual_norm.to(beta.dtype)
-
-        # SVD-based LS: y_full = V * S^+ * U^T * beta
-        U, S, VT = torch.linalg.svd(A_ls, full_matrices=False)
-        tol = (
-            torch.finfo(H.dtype).eps * max(A_ls.shape) * (S.max() + 1)
-        )  # simple cutoff
-        Sinv = torch.where(S > tol, 1.0 / S, torch.zeros_like(S))
-        y_full = VT.transpose(0, 1) @ (
-            Sinv * (U.transpose(0, 1) @ beta)
-        )  # (restart,)
-
-        dx = V[:, :-1] @ y_full
-        x = x0 + dx
-
-        # New (preconditioned) residual
-        residual = cls.compute_residual(b, x, primals)
-
-        unit_residual_new, residual_norm_new = GMRESSolver._safe_normalize(
-            residual
-        )
-
-        return x, unit_residual_new, residual_norm_new
-
-    @staticmethod
-    def _gmres_cond_fun(x, k, ures, rnorm, b, maxiter, thresh, restart, *_):
-        return (k < maxiter) & (rnorm > thresh)
-
-    @classmethod
-    def _gmres_body_fun(
-        cls, x, k, ures, rnorm, b, maxiter, thresh, restart, *primals
-    ):
-        x_new, ures_new, rnorm_new = cls._gmres_batched(
-            b, x, ures, rnorm, restart, primals
-        )
-        return x_new, k + 1, ures_new, rnorm_new
-
-    @classmethod
-    def gmres(
-        cls,
-        b: torch.Tensor,
-        primals,
-        x0: torch.Tensor | None = None,
-        tol: float = 1e-5,
-        atol: float = 0.0,
-        restart: int = 20,
-        maxiter: int | None = None,
-    ):
-        """
-        GMRES solves A x = b.
-
-        A: function taking a 1D tensor and returning a 1D tensor.
-        Residual used for convergence is the *preconditioned* residual r = M @ (b - A(x)).
-        Converged when ||r|| <= max(tol * ||b||, atol).
-
-        A is specified as a function performing A(vi) -> vf = A @ vi, and in principle
-        need not have any particular special properties, such as symmetry. However,
-        convergence is often slow for nearly symmetric operators.
-
-        Parameters
-        ----------
-        b : torch.Tensor
-            Right hand side of the linear system representing a single vector. Can be
-            stored as an array or Python container of array(s) with any shape.
-
-        Returns
-        -------
-        x : tensor
-            The converged solution. Has the same structure as ``b``.
-
-        Other Parameters
-        ----------------
-        x0 : tensor, optional
-            Starting guess for the solution. Must have the same structure as ``b``.
-            If this is unspecified, zeroes are used.
-        tol, atol : float, optional
-            Tolerances for convergence, ``norm(residual) <= max(tol*norm(b), atol)``.
-        restart : integer, optional
-            Size of the Krylov subspace ("number of iterations") built between
-            restarts. GMRES works by approximating the true solution x as its
-            projection into a Krylov space of this dimension - this parameter
-            therefore bounds the maximum accuracy achievable from any guess
-            solution. Larger values increase both number of iterations and iteration
-            cost, but may be necessary for convergence. The algorithm terminates
-            early if convergence is achieved before the full subspace is built.
-            Default is 20.
-        maxiter : integer
-            Maximum number of times to rebuild the size-``restart`` Krylov space
-            starting from the solution found at the last iteration. If GMRES
-            halts or is very slow, decreasing this parameter may help.
-            Default is infinite.
-        """
-
-        assert b.ndim == 1, "This implementation expects 1D vectors."
-        device, dtype = b.device, b.dtype
-        m = b.shape[0]
-
-        if x0 is None:
-            x0 = torch.zeros_like(b)
-
-        restart = int(min(restart, m))
-
-        if x0.shape != b.shape:
-            raise ValueError("x0 and b must have matching shape")
-
-        # Build tensor tolerances
-        b_norm = torch.linalg.vector_norm(b)
-        atol_t = torch.as_tensor(atol, dtype=dtype, device=device)
-        thresh = torch.maximum(
-            torch.as_tensor(tol, dtype=dtype, device=device) * b_norm, atol_t
-        )
-
-        # Initial (left-preconditioned) residual
-        residual0 = cls.compute_residual(b, x0, primals)
-        unit_residual, residual_norm = GMRESSolver._safe_normalize(residual0)
-
-        # Early exit if already converged
-        if residual_norm <= thresh:
-            return x0
-
-        # while_loop state must be tensors
-        k0 = torch.tensor(0, dtype=torch.int64, device=device)
-
-        if maxiter is None:
-            maxiter_t = torch.tensor(10 * m, device=device, dtype=torch.int64)
-        else:
-            maxiter_t = torch.as_tensor(
-                maxiter, device=device, dtype=torch.int64
-            )
-
-        (
-            x_final,
-            *_,
-        ) = ops.higher_order.while_loop(
-            GMRESSolver._gmres_cond_fun,
-            cls._gmres_body_fun,
-            (x0, k0, unit_residual, residual_norm),
-            (b, maxiter_t, thresh, restart) + primals,
-        )
-
-        return x_final
-
-
-class StockSolverSum(ExplicitADFunction, GMRESSolver):
+class StockSolverSum(ExplicitADFunction):
     """
     Sum-reduction wrapper around StockSolverFunc:
       y = sum_b StockSolverFunc(Q, m, c, X, budget, kappa, theta, p, x0)[b, :]
@@ -2210,6 +1901,9 @@ class StockSolverSum(ExplicitADFunction, GMRESSolver):
         dy = dx_batched.sum(dim=0)  # (n,)
         return (dy,)
 
+    """
+    GMRES Solver
+    """
     @classmethod
     def matvec(cls, x, primals):
         return cls.jvp_from_primals(primals, x)
@@ -2217,6 +1911,305 @@ class StockSolverSum(ExplicitADFunction, GMRESSolver):
     @classmethod
     def compute_residual(cls, b, x, primals):
         return b - cls.matvec(x, primals)
+
+    @staticmethod
+    def _safe_normalize(x: torch.Tensor):
+        """
+        L2-normalize x; if ||x|| <= thresh, return (0 vector, 0).
+        """
+        thresh = torch.finfo(x.dtype).eps
+        thresh_t = torch.as_tensor(thresh, dtype=x.dtype, device=x.device)
+        return StockSolverSum._safe_normalize_thresh(x, thresh_t)
+
+    @staticmethod
+    def _safe_normalize_thresh(x: torch.Tensor, thresh: torch.Tensor):
+        norm = torch.linalg.vector_norm(x)  # scalar tensor
+
+        # Avoid div-by-zero by clamping the denominator
+        safe_norm = torch.clamp(norm, min=thresh)
+
+        y = x / safe_norm  # well-defined
+        use = norm > thresh
+
+        y = torch.where(use, y, torch.zeros_like(x))
+        norm_out = torch.where(use, norm, norm.new_zeros(()))
+
+        return y, norm_out
+
+    @staticmethod
+    def _iterative_classical_gram_schmidt(
+        Q: torch.Tensor,
+        x: torch.Tensor,
+    ):
+        """
+        Classical GS with optional re-orth (\"twice is enough\").
+        Returns (q_unit, r) where q_unit ⟂ cols(Q).
+        """
+        m, k = Q.shape
+        assert x.shape == (m,)
+
+        # First orthogonalization
+        r0 = x @ Q
+        q0 = x - (Q @ r0)  # (m,)
+        # Second orthogonalization
+        h1 = q0 @ Q
+        r1 = r0 + h1
+        q1 = q0 - (Q @ h1)
+        # Final orthogonalization
+        h = q1 @ Q
+        r = r1 + h
+        q = q1 - (Q @ h)
+        return q, r
+
+    @classmethod
+    def _kth_arnoldi_iteration(
+        cls,
+        k: torch.Tensor,  # scalar int tensor
+        V: torch.Tensor,  # (m, restart+1)
+        H: torch.Tensor,  # (restart, restart+1)
+        primals,  # tuple
+    ):
+        device, dtype = V.device, V.dtype
+        m, ncols = V.shape
+        restart = H.shape[0]  # ncols == restart+1
+
+        # Select v_k without Python ints
+        e_k = functional.one_hot(k.to(torch.int64), num_classes=ncols).to(
+            dtype=dtype, device=device
+        )  # (ncols,)
+        v_k = V @ e_k  # (m,)
+
+        # Arnoldi “apply, orthogonalize”
+        w = cls.matvec(v_k, primals)
+        _, w_norm0 = StockSolverSum._safe_normalize(w)
+
+        # Project against ALL columns in V (unused ones are zeros, so harmless)
+        q, r = StockSolverSum._iterative_classical_gram_schmidt(
+            V, w
+        )  # r: (ncols,)
+
+        tol = (
+            torch.as_tensor(torch.finfo(dtype).eps, dtype=dtype, device=device)
+            * w_norm0
+        )
+        unit_v, v_norm_1 = StockSolverSum._safe_normalize_thresh(q, tol)
+
+        # Write V[:, k+1] with a one-hot mask (no Python indexing)
+        e_kp1 = functional.one_hot(
+            (k + 1).to(torch.int64), num_classes=ncols
+        ).to(
+            dtype=dtype, device=device
+        )  # (ncols,)
+        V_new = V * (1 - e_kp1).unsqueeze(0) + unit_v.unsqueeze(
+            1
+        ) * e_kp1.unsqueeze(
+            0
+        )  # (m, ncols)
+
+        # Build H row k: [r_0..r_k, v_norm_1, 0..]
+        # Set position k+1 to v_norm_1 using one-hot overwrite trick
+        h_full = r + e_kp1 * (v_norm_1 - (r * e_kp1).sum())  # (ncols,)
+
+        row_mask = (
+            functional.one_hot(k.to(torch.int64), num_classes=restart)
+            .to(dtype=dtype, device=device)
+            .unsqueeze(1)
+        )  # (restart,1)
+        H_new = H * (1 - row_mask) + h_full.unsqueeze(0) * row_mask
+
+        breakdown = v_norm_1 == 0
+        return V_new, H_new, breakdown
+
+    @staticmethod
+    def _loop_cond(V, H, breakdown, k, restart, *_):
+        return (k < restart) & (~breakdown)
+
+    @classmethod
+    def _arnoldi_process(cls, V, H, breakdown, k, restart, *primals):
+        V2, H2, breakdown2 = cls._kth_arnoldi_iteration(k, V, H, primals)
+        return V2, H2, breakdown2, k + 1
+
+    @classmethod
+    def _gmres_batched(
+        cls, b, x0, unit_residual, residual_norm, restart: int, primals
+    ):
+        device, dtype = b.device, b.dtype
+        m = b.shape[0]
+        ncols = restart + 1
+        # func_wrapper.set_function(f)
+
+        # V: (m, restart+1); first column = unit_residual
+        V0 = torch.zeros((m, ncols), dtype=dtype, device=device)
+        V0[:, 0] = unit_residual
+
+        # H: (restart, restart+1)
+        H0 = torch.zeros((restart, ncols), dtype=dtype, device=device)
+
+        # If no steps requested, skip the while_loop to avoid zero-iteration aliasing
+        k0 = torch.tensor(0, dtype=torch.int64, device=device)
+        br0 = torch.tensor(False, dtype=torch.bool, device=device)
+
+        V, H, _, k = ops.higher_order.while_loop(
+            StockSolverSum._loop_cond,
+            cls._arnoldi_process,
+            (V0, H0, br0, k0),
+            (restart,) + primals,
+        )
+        # Solve least squares: (Hj^T) y ≈ beta * e1   with Hj = H[:j, :j+1]
+        # Fixed-shape LS: solve min || H^T y - beta e1 ||
+        # Build masked, fixed-size matrix A_ls (no Python slicing by k)
+        ncols = H.shape[1]  # restart + 1
+        idx_r = torch.arange(H.shape[0], device=H.device)  # 0..restart-1
+        idx_c = torch.arange(ncols, device=H.device)  # 0..restart
+        row_mask = (idx_c <= k).to(H.dtype)  # keep rows 0..k in H^T
+        y_mask = (idx_r < k).to(H.dtype)  # unknowns y[0..k-1]
+
+        Ht = H.transpose(0, 1)  # (ncols, restart)
+        A_ls = Ht * y_mask.unsqueeze(0)  # zero inactive columns
+        A_ls = A_ls * row_mask.unsqueeze(1)  # zero rows beyond k
+
+        beta = torch.zeros(ncols, dtype=H.dtype, device=H.device)
+        beta[0] = residual_norm.to(beta.dtype)
+
+        # SVD-based LS: y_full = V * S^+ * U^T * beta
+        U, S, VT = torch.linalg.svd(A_ls, full_matrices=False)
+        tol = (
+            torch.finfo(H.dtype).eps * max(A_ls.shape) * (S.max() + 1)
+        )  # simple cutoff
+        Sinv = torch.where(S > tol, 1.0 / S, torch.zeros_like(S))
+        y_full = VT.transpose(0, 1) @ (
+            Sinv * (U.transpose(0, 1) @ beta)
+        )  # (restart,)
+
+        dx = V[:, :-1] @ y_full
+        x = x0 + dx
+
+        # New (preconditioned) residual
+        residual = cls.compute_residual(b, x, primals)
+
+        unit_residual_new, residual_norm_new = StockSolverSum._safe_normalize(
+            residual
+        )
+
+        return x, unit_residual_new, residual_norm_new
+
+    @staticmethod
+    def _gmres_cond_fun(x, k, ures, rnorm, b, maxiter, thresh, restart, *_):
+        return (k < maxiter) & (rnorm > thresh)
+
+    @classmethod
+    def _gmres_body_fun(
+        cls, x, k, ures, rnorm, b, maxiter, thresh, restart, *primals
+    ):
+        x_new, ures_new, rnorm_new = cls._gmres_batched(
+            b, x, ures, rnorm, restart, primals
+        )
+        return x_new, k + 1, ures_new, rnorm_new
+
+    @classmethod
+    def gmres(
+        cls,
+        b: torch.Tensor,
+        primals,
+        x0: torch.Tensor | None = None,
+        tol: float = 1e-5,
+        atol: float = 0.0,
+        restart: int = 20,
+        maxiter: int | None = None,
+    ):
+        """
+        GMRES solves A x = b.
+
+        A: function taking a 1D tensor and returning a 1D tensor.
+        Residual used for convergence is the *preconditioned* residual r = M @ (b - A(x)).
+        Converged when ||r|| <= max(tol * ||b||, atol).
+
+        A is specified as a function performing A(vi) -> vf = A @ vi, and in principle
+        need not have any particular special properties, such as symmetry. However,
+        convergence is often slow for nearly symmetric operators.
+
+        Parameters
+        ----------
+        b : torch.Tensor
+            Right hand side of the linear system representing a single vector. Can be
+            stored as an array or Python container of array(s) with any shape.
+
+        Returns
+        -------
+        x : tensor
+            The converged solution. Has the same structure as ``b``.
+
+        Other Parameters
+        ----------------
+        x0 : tensor, optional
+            Starting guess for the solution. Must have the same structure as ``b``.
+            If this is unspecified, zeroes are used.
+        tol, atol : float, optional
+            Tolerances for convergence, ``norm(residual) <= max(tol*norm(b), atol)``.
+        restart : integer, optional
+            Size of the Krylov subspace ("number of iterations") built between
+            restarts. GMRES works by approximating the true solution x as its
+            projection into a Krylov space of this dimension - this parameter
+            therefore bounds the maximum accuracy achievable from any guess
+            solution. Larger values increase both number of iterations and iteration
+            cost, but may be necessary for convergence. The algorithm terminates
+            early if convergence is achieved before the full subspace is built.
+            Default is 20.
+        maxiter : integer
+            Maximum number of times to rebuild the size-``restart`` Krylov space
+            starting from the solution found at the last iteration. If GMRES
+            halts or is very slow, decreasing this parameter may help.
+            Default is infinite.
+        """
+
+        assert b.ndim == 1, "This implementation expects 1D vectors."
+        device, dtype = b.device, b.dtype
+        m = b.shape[0]
+
+        if x0 is None:
+            x0 = torch.zeros_like(b)
+
+        restart = int(min(restart, m))
+
+        if x0.shape != b.shape:
+            raise ValueError("x0 and b must have matching shape")
+
+        # Build tensor tolerances
+        b_norm = torch.linalg.vector_norm(b)
+        atol_t = torch.as_tensor(atol, dtype=dtype, device=device)
+        thresh = torch.maximum(
+            torch.as_tensor(tol, dtype=dtype, device=device) * b_norm, atol_t
+        )
+
+        # Initial (left-preconditioned) residual
+        residual0 = cls.compute_residual(b, x0, primals)
+        unit_residual, residual_norm = StockSolverSum._safe_normalize(residual0)
+
+        # Early exit if already converged
+        if residual_norm <= thresh:
+            return x0
+
+        # while_loop state must be tensors
+        k0 = torch.tensor(0, dtype=torch.int64, device=device)
+
+        if maxiter is None:
+            maxiter_t = torch.tensor(10 * m, device=device, dtype=torch.int64)
+        else:
+            maxiter_t = torch.as_tensor(
+                maxiter, device=device, dtype=torch.int64
+            )
+
+        (
+            x_final,
+            *_,
+        ) = ops.higher_order.while_loop(
+            StockSolverSum._gmres_cond_fun,
+            cls._gmres_body_fun,
+            (x0, k0, unit_residual, residual_norm),
+            (b, maxiter_t, thresh, restart) + primals,
+        )
+
+        return x_final
 
 
 class ImplicitFunction(ExplicitADFunction):
@@ -2243,7 +2236,7 @@ class ImplicitFunction(ExplicitADFunction):
           vjp_from_primals(saved, bar_y, needs_input_grad=None) -> tuple(grads_per_input)
         (Single-tensor output is assumed. If your F returns a tuple of outputs,
          adapt this class: a single-output is required for GMRES right-hand side.)
-      - Provides GMRES interface via inheritance from your GMRESSolver:
+      - Provides GMRES interface via inheritance from your StockSolverSum:
           matvec(x, primals) -> A @ x
           compute_residual(b, x, primals) -> b - A @ x
           gmres(b, primals, x0=None, tol=..., atol=..., restart=..., maxiter=...) -> x
@@ -2333,7 +2326,7 @@ class ImplicitFunction(ExplicitADFunction):
 
         for _ in range(cls._newton_maxiter):
             # Residual at current iterate
-            y_cur = ImplicitFunction._unwrap_single(Func.compute(*xs))
+            y_cur = cls._unwrap_single(Func.compute(*xs))
             r = y_cur - y_target
             r_before = torch.linalg.vector_norm(r)
             if r_before <= torch.as_tensor(
@@ -2345,7 +2338,7 @@ class ImplicitFunction(ExplicitADFunction):
             primals = Func.compute_primals(*xs, outputs=y_cur)
             x_shape = x_var.shape
 
-            class _J(GMRESSolver):
+            class _J(StockSolverSum):
                 @classmethod
                 def matvec(cls2, v_flat, primals_):
                     v = v_flat.view(x_shape)
@@ -2379,7 +2372,7 @@ class ImplicitFunction(ExplicitADFunction):
                 x_trial = x_var + alpha * dx
                 xs_trial = list(xs)
                 xs_trial[var_i] = x_trial
-                y_trial = ImplicitFunction._unwrap_single(Func.compute(*xs_trial))
+                y_trial = cls._unwrap_single(Func.compute(*xs_trial))
                 r_after = torch.linalg.vector_norm(y_trial - y_target)
 
                 if r_after <= r_before:  # accept
@@ -2417,7 +2410,7 @@ class ImplicitFunction(ExplicitADFunction):
         xs_sol = list(inputs)
         xs_sol[var_i] = outputs.detach()
 
-        y_sol = ImplicitFunction._unwrap_single(cls.func.compute(*xs_sol))
+        y_sol = cls._unwrap_single(cls.func.compute(*xs_sol))
         primals_F = cls.func.compute_primals(*xs_sol, outputs=y_sol)
 
         return {
@@ -2450,7 +2443,7 @@ class ImplicitFunction(ExplicitADFunction):
         shape_y = saved["shape_y"]
         Func = cls.func
 
-        class _JT(GMRESSolver):
+        class _JT(StockSolverSum):
             @classmethod
             def matvec(cls2, v_flat, primals_):
                 v_y = v_flat.view(shape_y)
