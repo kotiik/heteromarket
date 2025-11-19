@@ -22,34 +22,33 @@ def find_start_point(wl, wh, L, U, p):
     )
     return x0
 
-class SimpleFunc:
-    @classmethod
-    def matvec(cls, x, primals):
-        return x
 
-    @classmethod
-    def compute_residual(cls, b, x, primals):
-        return b - x
+def simple_matvec(x, primals):
+    return x
 
 
-class LinearFunc(SimpleFunc):
-    @classmethod
-    def matvec(self, x, primals):
-        A, M = primals
-        return M @ (A @ x)
-
-    @classmethod
-    def compute_residual(self, b, x, primals):
-        A, M = primals
-        return M @ (b - A @ x)
+def simple_residual(b, x, primals):
+    return b - StockSolverSum.matvec(x, primals)
 
 
-class SimpleFuncGMRES(SimpleFunc, StockSolverSum):
-    pass
+def linear_matvec(x, primals):
+    A, M = primals
+    return M @ (A @ x)
 
 
-class LinearFuncGMRES(LinearFunc, StockSolverSum):
-    pass
+def linear_residual(b, x, primals):
+    A, M = primals
+    return M @ (b - A @ x)
+
+
+class SimpleFuncGMRES(StockSolverSum):
+    StockSolverSum.matvec = simple_matvec
+
+
+class LinearFuncGMRES(StockSolverSum):
+    StockSolverSum.matvec = linear_matvec
+    StockSolverSum.compute_residual = linear_residual
+
 
 class TestSafeNormalize(unittest.TestCase):
     def assertNoNaN(self, t: torch.Tensor):
@@ -301,7 +300,8 @@ def twopass_cgs(V_used: torch.Tensor, w: torch.Tensor):
 class TestKthArnoldiIteration(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(1234)
-        self.func = SimpleFuncGMRES()
+        StockSolverSum.matvec = simple_matvec
+        StockSolverSum.compute_residual = simple_residual
 
     def assertAllClose(self, a, b, dtype, atol=None, rtol=0.0, msg=""):
         if atol is None:
@@ -321,13 +321,13 @@ class TestKthArnoldiIteration(unittest.TestCase):
         # Run function under test (tensor k)
         k_t = torch.tensor(k, dtype=torch.int64, device=device)
         primals = (f_state, M)
-        V_out, H_out, breakdown = self.func._kth_arnoldi_iteration(
+        V_out, H_out, breakdown = StockSolverSum._kth_arnoldi_iteration(
             k_t, V_init.clone(), H_init.clone(), primals
         )
 
         # Manual expectation
         v_k = V_init[:, k]
-        w = self.func.matvec(v_k, primals)
+        w = StockSolverSum.matvec(v_k, primals)
         # Build two-pass CGS against used columns 0..k
         V_used = V_init[:, : k + 1]
         r_used, q2 = twopass_cgs(V_used, w)  # r_used length k+1, q2 unnormalized
@@ -405,7 +405,7 @@ class TestKthArnoldiIteration(unittest.TestCase):
 
                 # Here w = M @ A(v_k) = v_k, which lies in span(V[:, :k+1]).
                 primals = (dummy_state, M)
-                V_out, H_out, breakdown = self.func._kth_arnoldi_iteration(
+                V_out, H_out, breakdown = StockSolverSum._kth_arnoldi_iteration(
                     torch.tensor(k, dtype=torch.int64), V.clone(), H.clone(), primals
                 )
                 # Expected: new column is zero, breakdown True
@@ -433,7 +433,7 @@ class TestKthArnoldiIteration(unittest.TestCase):
                 M = torch.eye(m, dtype=dtype)
 
                 primals = (dummy_state, M)
-                V_out, H_out, breakdown = self.func._kth_arnoldi_iteration(
+                V_out, H_out, breakdown = StockSolverSum._kth_arnoldi_iteration(
                     torch.tensor(k, dtype=torch.int64), V, H, primals
                 )
 
@@ -458,7 +458,8 @@ def _normalize_like_impl(x: torch.Tensor):
 class TestGMRESBatched(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(1234)
-        self.func = LinearFuncGMRES()
+        StockSolverSum.matvec = linear_matvec
+        StockSolverSum.compute_residual = linear_residual
 
     def assertAllClose(self, a, b, dtype, atol=None, rtol=0.0, msg=""):
         if atol is None:
@@ -469,7 +470,7 @@ class TestGMRESBatched(unittest.TestCase):
 
     def _prep_initial_residual(self, f_state, M, b, x0):
         primals = (f_state, M)
-        r0 = self.func.compute_residual(b, x0, primals)
+        r0 = StockSolverSum.compute_residual(b, x0, primals)
         unit_residual, residual_norm = _normalize_like_impl(r0)
         return unit_residual, residual_norm
 
@@ -487,7 +488,7 @@ class TestGMRESBatched(unittest.TestCase):
 
                 primals = (I, M)
                 # Any restart >= 1 should solve exactly in one step
-                x, ures, rnorm = self.func._gmres_batched(
+                x, ures, rnorm = StockSolverSum._gmres_batched(
                     b, x0, unit_residual, residual_norm, 3, primals
                 )
 
@@ -514,7 +515,7 @@ class TestGMRESBatched(unittest.TestCase):
                 primals = (D, M)
                 unit_residual, residual_norm = self._prep_initial_residual(D, M, b, x0)
 
-                x, ures, rnorm = self.func._gmres_batched(
+                x, ures, rnorm = StockSolverSum._gmres_batched(
                     b, x0, unit_residual, residual_norm, 1, primals
                 )
 
@@ -541,13 +542,13 @@ class TestGMRESBatched(unittest.TestCase):
 
                 primals = (A_mat, M)
                 # restart >= m should produce the exact solve (up to fp error)
-                x, ures, rnorm = self.func._gmres_batched(
+                x, ures, rnorm = StockSolverSum._gmres_batched(
                     b, x0, unit_residual, residual_norm, m, primals
                 )
 
                 # Check solution and residual
                 self.assertAllClose(x, x_true, dtype)
-                res = self.func.compute_residual(b, x, primals)
+                res = StockSolverSum.compute_residual(b, x, primals)
                 self.assertTrue(
                     torch.allclose(
                         res,
@@ -575,10 +576,10 @@ class TestGMRESBatched(unittest.TestCase):
                 unit_residual, residual_norm = self._prep_initial_residual(D, M, b, x0)
 
                 primals = (D, M)
-                x1, _, _ = self.func._gmres_batched(
+                x1, _, _ = StockSolverSum._gmres_batched(
                     b, x0, unit_residual, residual_norm, 1, primals
                 )
-                x3, _, _ = self.func._gmres_batched(
+                x3, _, _ = StockSolverSum._gmres_batched(
                     b, x0, unit_residual, residual_norm, 3, primals
                 )
 
@@ -595,7 +596,7 @@ class TestGMRESBatched(unittest.TestCase):
 
                 x_true = torch.randn(m, dtype=dtype)
                 primals = (A_mat, M)
-                b = self.func.matvec(x_true, primals)
+                b = StockSolverSum.matvec(x_true, primals)
                 x0 = x_true.clone()  # start at the solution
 
                 unit_residual, residual_norm = self._prep_initial_residual(
@@ -609,7 +610,7 @@ class TestGMRESBatched(unittest.TestCase):
                 )
 
                 primals = (A_mat, M)
-                x, ures, rnorm = self.func._gmres_batched(
+                x, ures, rnorm = StockSolverSum._gmres_batched(
                     b, x0, unit_residual, residual_norm, 4, primals
                 )
 
@@ -632,7 +633,7 @@ class TestGMRESBatched(unittest.TestCase):
                 )
 
                 primals = (A_mat, M)
-                x, ures, rnorm = self.func._gmres_batched(
+                x, ures, rnorm = StockSolverSum._gmres_batched(
                     b, x0, unit_residual, residual_norm, restart, primals
                 )
 
@@ -655,7 +656,8 @@ class TestGMRESvsJAX(unittest.TestCase):
     def setUp(self):
         np.random.seed(1234)
         torch.manual_seed(1234)
-        self.func = LinearFuncGMRES()
+        StockSolverSum.matvec = linear_matvec
+        StockSolverSum.compute_residual = linear_residual
 
     def assertAllCloseTorch(self, a, b, dtype, atol=None, rtol=0.0):
         if atol is None:
@@ -683,7 +685,7 @@ class TestGMRESvsJAX(unittest.TestCase):
             M_t = torch.tensor(M_mat_np, dtype=dtype)
 
         primals = (A_t, M_t)
-        x_t = self.func.gmres(
+        x_t = StockSolverSum.gmres(
             b_t,
             primals,
             x0=x0_t,
@@ -744,7 +746,7 @@ class TestGMRESvsJAX(unittest.TestCase):
                 A_t = torch.tensor(A_np, dtype=dtype)
                 M_t = torch.eye(A_np.shape[0], dtype=dtype)
                 primals = (A_t, M_t)
-                r_t = self.func.compute_residual(b_t, x_t,primals)
+                r_t = StockSolverSum.compute_residual(b_t, x_t,primals)
                 self.assertAllCloseTorch(
                     torch.linalg.vector_norm(r_t), torch.tensor(0.0, dtype=dtype), dtype
                 )
@@ -781,7 +783,7 @@ class TestGMRESvsJAX(unittest.TestCase):
                 A_t = torch.tensor(A_np, dtype=dtype)
                 M_t = torch.eye(A_np.shape[0], dtype=dtype)
                 primals = (A_t, M_t)
-                rt = self.func.compute_residual(b_t, x_t, primals)
+                rt = StockSolverSum.compute_residual(b_t, x_t, primals)
                 self.assertAllCloseTorch(
                     torch.linalg.vector_norm(rt), torch.tensor(0.0, dtype=dtype), dtype
                 )
@@ -838,7 +840,7 @@ class TestGMRESvsJAX(unittest.TestCase):
                 A_t = torch.tensor(A_np, dtype=dtype)
                 M_t = torch.tensor(M_np, dtype=dtype)
                 primals = (A_t, M_t)
-                rt = self.func.compute_residual(b_t, x_t, primals)
+                rt = StockSolverSum.compute_residual(b_t, x_t, primals)
                 self.assertAllCloseTorch(
                     torch.linalg.vector_norm(rt), torch.tensor(0.0, dtype=dtype), dtype
                 )
