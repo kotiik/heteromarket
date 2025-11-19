@@ -301,10 +301,6 @@ class ExplicitADFunction(torch.autograd.Function):
     def jvp_with_primals(cls, saved: Any, *tangents: torch.Tensor):
         return cls.jvp_from_primals(saved, *tangents)
 
-    @classmethod
-    def apply(cls, *args, **kwargs):  # type: ignore[override]
-        return super(ExplicitADFunction, cls).apply(*args, **kwargs)
-
 
 class SolverState(NamedTuple):
     """
@@ -982,8 +978,8 @@ class ActiveSetQPFunc(ExplicitADFunction):
             budget_w,
             _,
         ) = ops.higher_order.while_loop(
-            ActiveSetQPFunc._exit_cond,
-            ActiveSetQPFunc._main_loop,
+            _active_set_exit_cond,
+            _active_set_main_loop,
             tuple(state),
             (Q, m, c, wl, wh, L, U, p),
         )
@@ -1258,6 +1254,15 @@ class ActiveSetQPFunc(ExplicitADFunction):
         # Final JVP: dx = dx_eq + dalpha * y + alpha * dy
         dx = dx_eq + dalpha.unsqueeze(-1) * y + alpha.unsqueeze(-1) * dy
         return (dx, None, None, None, None)
+
+
+# Wrappers that Dynamo sees as plain functions
+def _active_set_exit_cond(*state_and_params):
+    return ActiveSetQPFunc._exit_cond(*state_and_params)
+ 
+
+def _active_set_main_loop(*state_and_params):
+    return ActiveSetQPFunc._main_loop(*state_and_params)
 
 
 class StockSolverPrimals(NamedTuple):
