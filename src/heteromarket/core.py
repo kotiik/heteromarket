@@ -2088,37 +2088,25 @@ def optimize_portfolio(
     """
     if Sigma.ndim == 2:
         return StockSolverFunc(
-            _to_float64_preserve_grad(Sigma, dtype=torch.float64).unsqueeze(0),
-            _to_float64_preserve_grad(
-                expected_returns, dtype=torch.float64
-            ).unsqueeze(0),
-            _to_float64_preserve_grad(
-                commission, dtype=torch.float64
-            ).unsqueeze(0),
-            _to_float64_preserve_grad(holdings, dtype=torch.float64).unsqueeze(
-                0
-            ),
-            _to_float64_preserve_grad(budget, dtype=torch.float64).unsqueeze(
-                0
-            ),
-            _to_float64_preserve_grad(
-                short_leverage, dtype=torch.float64
-            ).unsqueeze(0),
-            _to_float64_preserve_grad(
-                long_leverage, dtype=torch.float64
-            ).unsqueeze(0),
-            _to_float64_preserve_grad(prices, dtype=torch.float64),
+            _to_float64_preserve_grad(Sigma).unsqueeze(0),
+            _to_float64_preserve_grad(expected_returns).unsqueeze(0),
+            _to_float64_preserve_grad(commission).unsqueeze(0),
+            _to_float64_preserve_grad(holding).unsqueeze(0),
+            _to_float64_preserve_grad(budget).unsqueeze(0),
+            _to_float64_preserve_grad(short_leverage).unsqueeze(0),
+            _to_float64_preserve_grad(long_leverage).unsqueeze(0),
+            _to_float64_preserve_grad(prices),
         )
     else:
         return StockSolverFunc(
-            _to_float64_preserve_grad(Sigma, dtype=torch.float64),
-            _to_float64_preserve_grad(expected_returns, dtype=torch.float64),
-            _to_float64_preserve_grad(commission, dtype=torch.float64),
-            _to_float64_preserve_grad(holdings, dtype=torch.float64),
-            _to_float64_preserve_grad(budget, dtype=torch.float64),
-            _to_float64_preserve_grad(short_leverage, dtype=torch.float64),
-            _to_float64_preserve_grad(long_leverage, dtype=torch.float64),
-            _to_float64_preserve_grad(prices, dtype=torch.float64),
+            _to_float64_preserve_grad(Sigma),
+            _to_float64_preserve_grad(expected_returns),
+            _to_float64_preserve_grad(commission),
+            _to_float64_preserve_grad(holdings),
+            _to_float64_preserve_grad(budget),
+            _to_float64_preserve_grad(short_leverage),
+            _to_float64_preserve_grad(long_leverage),
+            _to_float64_preserve_grad(prices),
         )
 
 
