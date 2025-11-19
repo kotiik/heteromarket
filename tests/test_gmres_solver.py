@@ -300,8 +300,14 @@ def twopass_cgs(V_used: torch.Tensor, w: torch.Tensor):
 class TestKthArnoldiIteration(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(1234)
+        self.saved_matvec = StockSolverSum.matvec
+        self.saved_compute_residual = StockSolverSum.compute_residual
         StockSolverSum.matvec = simple_matvec
         StockSolverSum.compute_residual = simple_residual
+
+    def tearDown(self):
+        StockSolverSum.matvec =  self.saved_matvec
+        StockSolverSum.compute_residual = self.saved_compute_residual
 
     def assertAllClose(self, a, b, dtype, atol=None, rtol=0.0, msg=""):
         if atol is None:
@@ -458,9 +464,15 @@ def _normalize_like_impl(x: torch.Tensor):
 class TestGMRESBatched(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(1234)
+        self.saved_matvec = StockSolverSum.matvec
+        self.saved_compute_residual = StockSolverSum.compute_residual        
         StockSolverSum.matvec = linear_matvec
         StockSolverSum.compute_residual = linear_residual
 
+    def tearDown(self):
+        StockSolverSum.matvec =  self.saved_matvec
+        StockSolverSum.compute_residual = self.saved_compute_residual
+        
     def assertAllClose(self, a, b, dtype, atol=None, rtol=0.0, msg=""):
         if atol is None:
             atol = 1e-5 if dtype == torch.float32 else 1e-12
@@ -656,9 +668,15 @@ class TestGMRESvsJAX(unittest.TestCase):
     def setUp(self):
         np.random.seed(1234)
         torch.manual_seed(1234)
+        self.saved_matvec = StockSolverSum.matvec
+        self.saved_compute_residual = StockSolverSum.compute_residual        
         StockSolverSum.matvec = linear_matvec
         StockSolverSum.compute_residual = linear_residual
 
+    def tearDown(self):
+        StockSolverSum.matvec =  self.saved_matvec
+        StockSolverSum.compute_residual = self.saved_compute_residual
+        
     def assertAllCloseTorch(self, a, b, dtype, atol=None, rtol=0.0):
         if atol is None:
             atol = 1e-5 if dtype == torch.float32 else 1e-12
