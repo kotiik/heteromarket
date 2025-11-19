@@ -2215,18 +2215,6 @@ class StockSolverSum(ExplicitADFunction, GMRESSolver):
         return b - cls.matvec(x, primals)
 
 
-def _unwrap_single(x):
-    """Allow either Tensor or (Tensor,). Raise if multiple outputs."""
-    if isinstance(x, tuple):
-        if len(x) != 1:
-            raise TypeError(
-                "ImplicitFunction expects func to have a single-tensor output. "
-                f"Got a tuple of length {len(x)} from jvp/vjp."
-            )
-        return x[0]
-    return x
-
-
 class ImplicitFunction(ExplicitADFunction):
     """
     Solve for one *variable input* x_var in a vector equation
@@ -2341,7 +2329,7 @@ class ImplicitFunction(ExplicitADFunction):
 
         for _ in range(cls._newton_maxiter):
             # Residual at current iterate
-            y_cur = cls._unwrap_single(Func.compute(*xs))
+            y_cur = ImplicitFunction._unwrap_single(Func.compute(*xs))
             r = y_cur - y_target
             r_before = torch.linalg.vector_norm(r)
             if r_before <= torch.as_tensor(
@@ -2387,7 +2375,7 @@ class ImplicitFunction(ExplicitADFunction):
                 x_trial = x_var + alpha * dx
                 xs_trial = list(xs)
                 xs_trial[var_i] = x_trial
-                y_trial = cls._unwrap_single(Func.compute(*xs_trial))
+                y_trial = ImplicitFunction._unwrap_single(Func.compute(*xs_trial))
                 r_after = torch.linalg.vector_norm(y_trial - y_target)
 
                 if r_after <= r_before:  # accept
@@ -2425,7 +2413,7 @@ class ImplicitFunction(ExplicitADFunction):
         xs_sol = list(inputs)
         xs_sol[var_i] = outputs.detach()
 
-        y_sol = cls._unwrap_single(cls.func.compute(*xs_sol))
+        y_sol = ImplicitFunction._unwrap_single(cls.func.compute(*xs_sol))
         primals_F = cls.func.compute_primals(*xs_sol, outputs=y_sol)
 
         return {
