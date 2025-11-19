@@ -1,5 +1,6 @@
 import importlib
 import unittest
+from unittest.mock import patch
 import torch
 
 import numpy as np
@@ -287,18 +288,11 @@ def twopass_cgs(V_used: torch.Tensor, w: torch.Tensor):
     r_used = h1 + h2  # (k+1,)
     return r_used, q2
 
-
+@patch.object(StockSolverSum, "matvec", new=simple_matvec)
+@patch.object(StockSolverSum, "compute_residual", new=simple_residual)
 class TestKthArnoldiIteration(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(1234)
-        self.saved_matvec = StockSolverSum.matvec
-        self.saved_compute_residual = StockSolverSum.compute_residual
-        StockSolverSum.matvec = simple_matvec
-        StockSolverSum.compute_residual = simple_residual
-
-    def tearDown(self):
-        StockSolverSum.matvec =  self.saved_matvec
-        StockSolverSum.compute_residual = self.saved_compute_residual
 
     def assertAllClose(self, a, b, dtype, atol=None, rtol=0.0, msg=""):
         if atol is None:
@@ -452,17 +446,11 @@ def _normalize_like_impl(x: torch.Tensor):
     return y, n_out
 
 
+@patch.object(StockSolverSum, "matvec", new=linear_matvec)
+@patch.object(StockSolverSum, "compute_residual", new=linear_residual)
 class TestGMRESBatched(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(1234)
-        self.saved_matvec = StockSolverSum.matvec
-        self.saved_compute_residual = StockSolverSum.compute_residual        
-        StockSolverSum.matvec = linear_matvec
-        StockSolverSum.compute_residual = linear_residual
-
-    def tearDown(self):
-        StockSolverSum.matvec =  self.saved_matvec
-        StockSolverSum.compute_residual = self.saved_compute_residual
         
     def assertAllClose(self, a, b, dtype, atol=None, rtol=0.0, msg=""):
         if atol is None:
@@ -655,18 +643,12 @@ def torch_to_jnp(x_t):
     return jnp.asarray(x_t.detach().cpu().numpy())
 
 
+@patch.object(StockSolverSum, "matvec", new=linear_matvec)
+@patch.object(StockSolverSum, "compute_residual", new=linear_residual)
 class TestGMRESvsJAX(unittest.TestCase):
     def setUp(self):
         np.random.seed(1234)
         torch.manual_seed(1234)
-        self.saved_matvec = StockSolverSum.matvec
-        self.saved_compute_residual = StockSolverSum.compute_residual        
-        StockSolverSum.matvec = linear_matvec
-        StockSolverSum.compute_residual = linear_residual
-
-    def tearDown(self):
-        StockSolverSum.matvec =  self.saved_matvec
-        StockSolverSum.compute_residual = self.saved_compute_residual
         
     def assertAllCloseTorch(self, a, b, dtype, atol=None, rtol=0.0):
         if atol is None:
