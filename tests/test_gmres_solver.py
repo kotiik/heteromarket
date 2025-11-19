@@ -41,15 +41,6 @@ def linear_residual(b, x, primals):
     return M @ (b - A @ x)
 
 
-class SimpleFuncGMRES(StockSolverSum):
-    StockSolverSum.matvec = simple_matvec
-
-
-class LinearFuncGMRES(StockSolverSum):
-    StockSolverSum.matvec = linear_matvec
-    StockSolverSum.compute_residual = linear_residual
-
-
 class TestSafeNormalize(unittest.TestCase):
     def assertNoNaN(self, t: torch.Tensor):
         self.assertFalse(torch.isnan(t).any().item(), "Tensor contains NaNs")
