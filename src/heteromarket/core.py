@@ -2076,8 +2076,8 @@ class StockSolverSum(ExplicitADFunction):
         br0 = torch.tensor(False, dtype=torch.bool, device=device)
 
         V, H, _, k = ops.higher_order.while_loop(
-            StockSolverSum._loop_cond,
-            StockSolverSum._arnoldi_process,
+            arnoldi_cond_fun,
+            arnoldi_body_fun,
             (V0, H0, br0, k0),
             (restart, mode) + primals,
         )
@@ -2226,17 +2226,53 @@ class StockSolverSum(ExplicitADFunction):
                 maxiter, device=device, dtype=torch.int64
             )
 
-        (
-            x_final,
-            *_,
-        ) = ops.higher_order.while_loop(
-            StockSolverSum._gmres_cond_fun,
-            StockSolverSum._gmres_body_fun,
+        x_final, *_ = ops.higher_order.while_loop(
+            gmres_cond_fun,
+            gmres_body_fun,
             (x0, k0, unit_residual, residual_norm),
             (b, maxiter_t, thresh, restart, mode) + primals,
         )
-
         return x_final
+
+# ---------- GMRES outer loop (Newton/GMRES) ----------
+
+def gmres_cond_fun(x, k, ures, rnorm, b, maxiter, thresh, restart, *rest):
+    """
+    Wrapper for StockSolverSum._gmres_cond_fun so TorchDynamo sees
+    a plain function instead of a class attribute.
+    """
+    return StockSolverSum._gmres_cond_fun(
+        x, k, ures, rnorm, b, maxiter, thresh, restart, *rest
+    )
+
+
+def gmres_body_fun(x, k, ures, rnorm, b, maxiter, thresh, restart, mode, *primals):
+    """
+    Wrapper for StockSolverSum._gmres_body_fun.
+    """
+    return StockSolverSum._gmres_body_fun(
+        x, k, ures, rnorm, b, maxiter, thresh, restart, mode, *primals
+    )
+
+
+# ---------- Inner Arnoldi loop for GMRES Krylov basis ----------
+
+def arnoldi_cond_fun(V, H, breakdown, k, restart, *rest):
+    """
+    Wrapper for StockSolverSum._loop_cond used inside the Arnoldi while_loop.
+    """
+    return StockSolverSum._loop_cond(
+        V, H, breakdown, k, restart, *rest
+    )
+
+
+def arnoldi_body_fun(V, H, breakdown, k, restart, mode, *primals):
+    """
+    Wrapper for StockSolverSum._arnoldi_process used inside the Arnoldi while_loop.
+    """
+    return StockSolverSum._arnoldi_process(
+        V, H, breakdown, k, restart, mode, *primals
+    )
 
 
 class ImplicitFunction(ExplicitADFunction):
