@@ -280,13 +280,39 @@ class ExplicitADFunction(torch.autograd.Function):
     # --------------- functional helpers ----------------
     @classmethod
     def fwd(cls, *inputs: torch.Tensor):
+        """
+        Pure forward evaluation with autograd disabled.
+
+        This is just a convenience wrapper around `compute`, so users who
+        want to call the mathematical operation without building a graph
+        can do:
+
+            y = MyFunc.fwd(*inputs)
+
+        instead of going through `.apply`.
+        """
         with torch.no_grad():
-            outputs, _ = cls.compute_primals(*inputs)
+            outputs = cls.compute(*inputs)
         return outputs
 
     @classmethod
     def primals(cls, *inputs: torch.Tensor):
-        outputs, saved = cls.compute_primals(*inputs)
+        """
+        Convenience helper to get (outputs, saved_primals) in one call,
+        **without** building an autograd graph.
+
+        This matches the subclass contract
+
+            compute(*inputs) -> outputs
+            compute_primals(*inputs, outputs) -> saved
+
+        and returns:
+
+            outputs, saved = MyFunc.primals(*inputs)
+        """
+        with torch.no_grad():
+            outputs = cls.compute(*inputs)
+            saved = cls.compute_primals(*inputs, outputs=outputs)
         return outputs, saved
 
     @classmethod
@@ -569,7 +595,7 @@ class ActiveSetQPFunc(ExplicitADFunction):
         p: torch.Tensor,  # (B, n)
         active_comp: torch.Tensor,  # (B, n)
         active_values: torch.Tensor,  # (B, n)
-        active_budget: torch.Tensor,  # (B, n)
+        active_budget: torch.Tensor,  # (B,)
         budget_w: torch.Tensor,  # (B,)
     ):
         # ---- Patch rows/cols for pinned variables ----
@@ -618,7 +644,7 @@ class ActiveSetQPFunc(ExplicitADFunction):
         p: torch.Tensor,  # (B, n)
         active_comp: torch.Tensor,  # (B, n)
         active_values: torch.Tensor,  # (B, n)
-        active_budget: torch.Tensor,  # (B, n)
+        active_budget: torch.Tensor,  # (B,)
         budget_w: torch.Tensor,  # (B,)
     ) -> torch.Tensor:
         primals = ActiveSetQPFunc._solve_under_active_int(
@@ -636,7 +662,7 @@ class ActiveSetQPFunc(ExplicitADFunction):
         L: torch.Tensor,  # (B, n)
         U: torch.Tensor,  # (B, n)
         active_comp: torch.Tensor,  # (B, n)
-        active_budget: torch.Tensor,  # (B, n)
+        active_budget: torch.Tensor,  # (B,)
     ) -> torch.Tensor:
         """
         Make the largest feasible step from x toward x_eq_proj while
@@ -689,7 +715,7 @@ class ActiveSetQPFunc(ExplicitADFunction):
         x_new: torch.Tensor,  # (B, n)
         p: torch.Tensor,  # (B, n)
         active_comp: torch.Tensor,  # (B, n)
-        active_budget: torch.Tensor,  # (B, n)
+        active_budget: torch.Tensor,  # (B,)
     ) -> tuple[torch.Tensor, torch.Tensor]:  # g: (B, n)  # g_along_p: (B,)
         """
         Compute gradient g (projected onto the budget tangent if a budget
