@@ -1904,13 +1904,39 @@ class StockSolverSum(ExplicitADFunction):
     """
     GMRES Solver
     """
-    @staticmethod
-    def matvec(x, primals):
-        return StockSolverSum.jvp_from_primals(primals, x)
+
+    @classmethod
+    def matvec(cls, x_flat: torch.Tensor, mode, primals):
+        """
+        GMRES wrapper that can apply either J (via jvp) or J^T (via vjp) for StockSolverSum.
+        """
+        # primals here is exactly whatever ImplicitFunction gave to gmres:
+        # typically the `primals_F` from func.compute_primals(...)
+        saved = primals[0] if isinstance(primals, tuple) and len(primals) == 1 else primals
+
+        # StockSolverSum's saved primals start with StockSolverPrimals:
+        # (x, p, budget, kappa, theta, ak, at, X, Q, ...)
+        p = saved[1]         # (n,) for shared price vector
+        n = p.shape[-1]
+        v = x_flat.view(n)   # Jacobian acts on shape (n,)
+
+        if mode == 0:
+            # J @ v  via forward-mode
+            tangents = (None, None, None, None, None, None, None, v, None)
+            (dy,) = StockSolverSum.jvp_from_primals(saved, *tangents)
+            return dy.reshape(-1)
+        elif mode == 1:
+            # J^T @ v via reverse-mode
+            grads = StockSolverSum.vjp_from_primals(saved, v, needs_input_grad=None)
+            g_p = grads[7]   # gradient w.r.t. price input
+            return g_p.reshape(-1)
+        else:
+            raise ValueError(f"Unknown GMRES kind")
+
 
     @staticmethod
-    def compute_residual(b, x, primals):
-        return b - StockSolverSum.matvec(x, primals)
+    def compute_residual(b, x, mode, primals):
+        return b - StockSolverSum.matvec(x, mode, primals)
 
     @staticmethod
     def _safe_normalize(x: torch.Tensor):
@@ -1966,6 +1992,7 @@ class StockSolverSum(ExplicitADFunction):
         k: torch.Tensor,  # scalar int tensor
         V: torch.Tensor,  # (m, restart+1)
         H: torch.Tensor,  # (restart, restart+1)
+        mode,
         primals,  # tuple
     ):
         device, dtype = V.device, V.dtype
@@ -1979,7 +2006,7 @@ class StockSolverSum(ExplicitADFunction):
         v_k = V @ e_k  # (m,)
 
         # Arnoldi “apply, orthogonalize”
-        w = StockSolverSum.matvec(v_k, primals)
+        w = StockSolverSum.matvec(v_k, mode, primals)
         _, w_norm0 = StockSolverSum._safe_normalize(w)
 
         # Project against ALL columns in V (unused ones are zeros, so harmless)
@@ -2020,17 +2047,17 @@ class StockSolverSum(ExplicitADFunction):
         return V_new, H_new, breakdown
 
     @staticmethod
-    def _loop_cond(V, H, breakdown, k, restart, *_):
+    def _loop_cond(V, H, breakdown, k, restart, mode, *_):
         return (k < restart) & (~breakdown)
 
     @staticmethod
-    def _arnoldi_process(V, H, breakdown, k, restart, *primals):
-        V2, H2, breakdown2 = StockSolverSum._kth_arnoldi_iteration(k, V, H, primals)
+    def _arnoldi_process(V, H, breakdown, k, restart, mode, *primals):
+        V2, H2, breakdown2 = StockSolverSum._kth_arnoldi_iteration(k, V, H, mode, primals)
         return V2, H2, breakdown2, k + 1
 
     @staticmethod
     def _gmres_batched(
-        b, x0, unit_residual, residual_norm, restart: int, primals
+        b, x0, unit_residual, residual_norm, restart, mode, primals
     ):
         device, dtype = b.device, b.dtype
         m = b.shape[0]
@@ -2052,7 +2079,7 @@ class StockSolverSum(ExplicitADFunction):
             StockSolverSum._loop_cond,
             StockSolverSum._arnoldi_process,
             (V0, H0, br0, k0),
-            (restart,) + primals,
+            (restart, mode) + primals,
         )
         # Solve least squares: (Hj^T) y ≈ beta * e1   with Hj = H[:j, :j+1]
         # Fixed-shape LS: solve min || H^T y - beta e1 ||
@@ -2084,7 +2111,7 @@ class StockSolverSum(ExplicitADFunction):
         x = x0 + dx
 
         # New (preconditioned) residual
-        residual = StockSolverSum.compute_residual(b, x, primals)
+        residual = StockSolverSum.compute_residual(b, x, 0, primals)
 
         unit_residual_new, residual_norm_new = StockSolverSum._safe_normalize(
             residual
@@ -2093,15 +2120,15 @@ class StockSolverSum(ExplicitADFunction):
         return x, unit_residual_new, residual_norm_new
 
     @staticmethod
-    def _gmres_cond_fun(x, k, ures, rnorm, b, maxiter, thresh, restart, *_):
+    def _gmres_cond_fun(x, k, ures, rnorm, b, maxiter, thresh, restart, mode, *_):
         return (k < maxiter) & (rnorm > thresh)
 
     @staticmethod
     def _gmres_body_fun(
-        x, k, ures, rnorm, b, maxiter, thresh, restart, *primals
+        x, k, ures, rnorm, b, maxiter, thresh, restart, mode, *primals
     ):
         x_new, ures_new, rnorm_new = StockSolverSum._gmres_batched(
-            b, x, ures, rnorm, restart, primals
+            b, x, ures, rnorm, restart, mode, primals
         )
         return x_new, k + 1, ures_new, rnorm_new
 
@@ -2113,6 +2140,7 @@ class StockSolverSum(ExplicitADFunction):
         tol: float = 1e-5,
         atol: float = 0.0,
         restart: int = 20,
+        mode: int = 0, # 0 or 1
         maxiter: int | None = None,
     ):
         """
@@ -2153,6 +2181,8 @@ class StockSolverSum(ExplicitADFunction):
             cost, but may be necessary for convergence. The algorithm terminates
             early if convergence is achieved before the full subspace is built.
             Default is 20.
+        mode : integer, optional
+            0 for JVP, 1 for VJP
         maxiter : integer
             Maximum number of times to rebuild the size-``restart`` Krylov space
             starting from the solution found at the last iteration. If GMRES
@@ -2180,7 +2210,7 @@ class StockSolverSum(ExplicitADFunction):
         )
 
         # Initial (left-preconditioned) residual
-        residual0 = StockSolverSum.compute_residual(b, x0, primals)
+        residual0 = StockSolverSum.compute_residual(b, x0, 0, primals)
         unit_residual, residual_norm = StockSolverSum._safe_normalize(residual0)
 
         # Early exit if already converged
@@ -2204,7 +2234,7 @@ class StockSolverSum(ExplicitADFunction):
             StockSolverSum._gmres_cond_fun,
             StockSolverSum._gmres_body_fun,
             (x0, k0, unit_residual, residual_norm),
-            (b, maxiter_t, thresh, restart) + primals,
+            (b, maxiter_t, thresh, restart, mode) + primals,
         )
 
         return x_final
