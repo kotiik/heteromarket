@@ -481,7 +481,7 @@ class TestGMRESBatched(unittest.TestCase):
                 primals = (I, M)
                 # Any restart >= 1 should solve exactly in one step
                 x, ures, rnorm = StockSolverSum._gmres_batched(
-                    b, x0, unit_residual, residual_norm, torch.zeros((3,)), torch.tensor(0, dtype=torch.inf64), primals
+                    b, x0, unit_residual, residual_norm, torch.zeros((3,)), torch.tensor(0, dtype=torch.int64), primals
                 )
 
                 # Expect x == b (A = I), residual zero
@@ -508,7 +508,7 @@ class TestGMRESBatched(unittest.TestCase):
                 unit_residual, residual_norm = self._prep_initial_residual(D, M, b, x0)
 
                 x, ures, rnorm = StockSolverSum._gmres_batched(
-                    b, x0, unit_residual, residual_norm, torch.zeros((3,)), torch.tensor(0, dtype=torch.inf64), primals
+                    b, x0, unit_residual, residual_norm, torch.zeros((3,)), torch.tensor(0, dtype=torch.int64), primals
                 )
 
                 self.assertAllClose(x, x_star, dtype)
@@ -535,7 +535,7 @@ class TestGMRESBatched(unittest.TestCase):
                 primals = (A_mat, M)
                 # restart >= m should produce the exact solve (up to fp error)
                 x, ures, rnorm = StockSolverSum._gmres_batched(
-                    b, x0, unit_residual, residual_norm, torch.zeros((m,)), torch.tensor(0, dtype=torch.inf64), primals
+                    b, x0, unit_residual, residual_norm, torch.zeros((m,)), torch.tensor(0, dtype=torch.int64), primals
                 )
 
                 # Check solution and residual
@@ -569,10 +569,10 @@ class TestGMRESBatched(unittest.TestCase):
 
                 primals = (D, M)
                 x1, _, _ = StockSolverSum._gmres_batched(
-                    b, x0, unit_residual, residual_norm, torch.zeros((1,)), torch.tensor(0, dtype=torch.inf64), primals
+                    b, x0, unit_residual, residual_norm, torch.zeros((1,)), torch.tensor(0, dtype=torch.int64), primals
                 )
                 x3, _, _ = StockSolverSum._gmres_batched(
-                    b, x0, unit_residual, residual_norm, torch.zeros((3,)), torch.tensor(0, dtype=torch.inf64), primals
+                    b, x0, unit_residual, residual_norm, torch.zeros((3,)), torch.tensor(0, dtype=torch.int64), primals
                 )
 
                 self.assertAllClose(x1, x3, dtype)
@@ -603,7 +603,7 @@ class TestGMRESBatched(unittest.TestCase):
 
                 primals = (A_mat, M)
                 x, ures, rnorm = StockSolverSum._gmres_batched(
-                    b, x0, unit_residual, residual_norm, torch.zeros((4,)), torch.tensor(0, dtype=torch.inf64), primals
+                    b, x0, unit_residual, residual_norm, torch.zeros((4,)), torch.tensor(0, dtype=torch.int64), primals
                 )
 
                 self.assertAllClose(x, x0, dtype)
@@ -626,7 +626,7 @@ class TestGMRESBatched(unittest.TestCase):
 
                 primals = (A_mat, M)
                 x, ures, rnorm = StockSolverSum._gmres_batched(
-                    b, x0, unit_residual, residual_norm, torch.zeros((restart,)), torch.tensor(0, dtype=torch.inf64), primals
+                    b, x0, unit_residual, residual_norm, torch.zeros((restart,)), torch.tensor(0, dtype=torch.int64), primals
                 )
 
                 self.assertEqual(x.dtype, dtype)
