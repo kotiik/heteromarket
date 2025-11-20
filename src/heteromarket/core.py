@@ -1511,7 +1511,7 @@ class StockSolverFunc(ExplicitADFunction):
         primals = ActiveSetQPFunc.compute_primals(*inputs, outputs=outputs)
         return (
             StockSolverPrimals(
-                outputs[0], p, budget, kappa, theta, ak, at, X, Q
+                outputs[0], p, budget, kappa, theta, ak, at, X, Q.clone() # To avoid aliasing
             )
             + primals
         )
@@ -2213,10 +2213,6 @@ class StockSolverSum(ExplicitADFunction):
         # Initial (left-preconditioned) residual
         residual0 = StockSolverSum.compute_residual(b, x0, 0, primals)
         unit_residual, residual_norm = StockSolverSum._safe_normalize(residual0)
-
-        # Early exit if already converged
-        if residual_norm <= thresh:
-            return x0
 
         # while_loop state must be tensors
         k0 = torch.tensor(0, dtype=torch.int64, device=device)
