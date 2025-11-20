@@ -1781,14 +1781,14 @@ def optimize_portfolio(
         expected_returns_t = _to_float64_preserve_grad(expected_returns).unsqueeze(0)
         return StockSolverFunc.apply(
             _to_float64_preserve_grad(Sigma).unsqueeze(0),
-            _to_float64_preserve_grad(expected_returns).unsqueeze(0),
+            expected_returns_t,
             _to_float64_preserve_grad(commission).unsqueeze(0),
             _to_float64_preserve_grad(holdings).unsqueeze(0),
             _to_float64_preserve_grad(budget).unsqueeze(0),
             _to_float64_preserve_grad(short_leverage).unsqueeze(0),
             _to_float64_preserve_grad(long_leverage).unsqueeze(0),
             _to_float64_preserve_grad(prices),
-            torch.zeros_like(expected_returns_t).unsqueeze(0)
+            torch.zeros_like(expected_returns_t)
         )
     else:
         expected_returns_t = _to_float64_preserve_grad(expected_returns)
