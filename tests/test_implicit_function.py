@@ -1,5 +1,6 @@
 import importlib
 import unittest
+from unittest.mock import patch
 import torch
 
 _core = importlib.import_module("heteromarket.core")
@@ -7,8 +8,9 @@ ExplicitADFunction = _core.ExplicitADFunction
 StockSolverSum = _core.StockSolverSum
 ImplicitFunction = _core.ImplicitFunction
 
+
 # -------- Concrete F and its GMRES wrapper used in tests --------
-class MyFunction(ExplicitADFunction):
+class MyFunctionGMRES(StockSolverSum):
     @staticmethod
     def compute(x1, x2):
         # Elementwise: y = x1^2 + 3*x2
@@ -36,16 +38,14 @@ class MyFunction(ExplicitADFunction):
         dx2 = dx2 if dx2 is not None else 0
         return 2 * x1 * dx1 + 3 * dx2
 
-
-class MyFunctionGMRES(MyFunction, StockSolverSum):
     @classmethod
-    def matvec(cls, x, primals):
+    def matvec(cls, x, mode, primals):
         # compute J_x1 @ x via JVP: dx1=x, dx2=None
         return cls.jvp_from_primals(primals, x, None)
 
     @classmethod
-    def compute_residual(cls, b, x, primals):
-        return b - cls.matvec(x, primals)
+    def compute_residual(cls, b, x, mode, primals):
+        return b - cls.matvec(x, mode, primals)
 
 
 # -------- Implicit class used in tests: solve for x1 (variable_input=1) --------
@@ -58,6 +58,12 @@ class GBad(ImplicitFunction):
     variable_input = 3  # but we'll pass only 2 inputs
 
 # =============================== TESTS =================================
+@patch.object(StockSolverSum, "compute", new=MyFunctionGMRES.compute)
+@patch.object(StockSolverSum, "compute_primals", new=MyFunctionGMRES.compute_primals)
+@patch.object(StockSolverSum, "vjp_from_primals", new=MyFunctionGMRES.vjp_from_primals)
+@patch.object(StockSolverSum, "jvp_from_primals", new=MyFunctionGMRES.jvp_from_primals)
+@patch.object(StockSolverSum, "matvec", new=MyFunctionGMRES.matvec)
+@patch.object(StockSolverSum, "compute_residual", new=MyFunctionGMRES.compute_residual)
 class TestImplicitFunction(unittest.TestCase):
 
     def test_forward_solve_scalar(self):
@@ -207,13 +213,13 @@ class Bratu1DF(torch.autograd.Function):
 # ---- GMRES-enabled Bratu function ----
 class Bratu1DGMRES(Bratu1DF, StockSolverSum):
     @classmethod
-    def matvec(cls, x, primals):
+    def matvec(cls, x, mode, primals):
         # single-input function: dx tangent is x
         return cls.jvp_from_primals(primals, x)
 
     @classmethod
-    def compute_residual(cls, b, x, primals):
-        return b - cls.matvec(x, primals)
+    def compute_residual(cls, b, x, mode, primals):
+        return b - cls.matvec(x, mode, primals)
 
     @classmethod
     def gmres(
@@ -236,7 +242,12 @@ class BratuImplicit(ImplicitFunction):
     func = Bratu1DGMRES
     variable_input = 1  # there is only one input (x)
 
-
+@patch.object(StockSolverSum, "compute", new=Bratu1DGMRES.compute)
+@patch.object(StockSolverSum, "compute_primals", new=Bratu1DGMRES.compute_primals)
+@patch.object(StockSolverSum, "vjp_from_primals", new=Bratu1DGMRES.vjp_from_primals)
+@patch.object(StockSolverSum, "jvp_from_primals", new=Bratu1DGMRES.jvp_from_primals)
+@patch.object(StockSolverSum, "matvec", new=Bratu1DGMRES.matvec)
+@patch.object(StockSolverSum, "compute_residual", new=Bratu1DGMRES.compute_residual)
 class TestBratuImplicit(unittest.TestCase):
     def test_bratu_residual_small(self):
         # Optional: make the test deterministic
@@ -334,13 +345,13 @@ class ExtendedRosenbrockF(ExplicitADFunction):
 # ---------- GMRES wrapper for Extended Rosenbrock ----------
 class ExtendedRosenbrockGMRES(ExtendedRosenbrockF, StockSolverSum):
     @classmethod
-    def matvec(cls, x, primals):
+    def matvec(cls, x, mode, primals):
         # single-input function: dx tangent is x
         return cls.jvp_from_primals(primals, x)
 
     @classmethod
-    def compute_residual(cls, b, x, primals):
-        return b - cls.matvec(x, primals)
+    def compute_residual(cls, b, x, mode, primals):
+        return b - cls.matvec(x, mode, primals)
 
 
 # ---------- Implicit solver: solve F(x) = 0 ----------
@@ -352,6 +363,13 @@ class RosenImplicit(ImplicitFunction):
 RosenImplicit._newton_maxiter = 100
 RosenImplicit._gmres_maxiter = 400
 
+
+@patch.object(StockSolverSum, "compute", new=ExtendedRosenbrockGMRES.compute)
+@patch.object(StockSolverSum, "compute_primals", new=ExtendedRosenbrockGMRES.compute_primals)
+@patch.object(StockSolverSum, "vjp_from_primals", new=ExtendedRosenbrockGMRES.vjp_from_primals)
+@patch.object(StockSolverSum, "jvp_from_primals", new=ExtendedRosenbrockGMRES.jvp_from_primals)
+@patch.object(StockSolverSum, "matvec", new=ExtendedRosenbrockGMRES.matvec)
+@patch.object(StockSolverSum, "compute_residual", new=ExtendedRosenbrockGMRES.compute_residual)
 class TestExtendedRosenbrockImplicit(unittest.TestCase):
     def test_extended_rosenbrock_residual_small(self):
         torch.manual_seed(0)
@@ -451,13 +469,13 @@ class Lorenz96F(ExplicitADFunction):
 # ---------- GMRES wrapper for Lorenz–96 ----------
 class Lorenz96GMRES(Lorenz96F, StockSolverSum):
     @classmethod
-    def matvec(cls, x, primals):
+    def matvec(cls, x, mode, primals):
         # Single-input function: tangent dx is x
         return cls.jvp_from_primals(primals, x)
 
     @classmethod
-    def compute_residual(cls, b, x, primals):
-        return b - cls.matvec(x, primals)
+    def compute_residual(cls, b, x, mode, primals):
+        return b - cls.matvec(x, mode, primals)
 
 
 # ---------- Implicit solver: solve F(x) = 0 ----------
@@ -467,6 +485,12 @@ class L96Implicit(ImplicitFunction):
 
 
 # =============================== TESTS =================================
+@patch.object(StockSolverSum, "compute", new=Lorenz96GMRES.compute)
+@patch.object(StockSolverSum, "compute_primals", new=Lorenz96GMRES.compute_primals)
+@patch.object(StockSolverSum, "vjp_from_primals", new=Lorenz96GMRES.vjp_from_primals)
+@patch.object(StockSolverSum, "jvp_from_primals", new=Lorenz96GMRES.jvp_from_primals)
+@patch.object(StockSolverSum, "matvec", new=Lorenz96GMRES.matvec)
+@patch.object(StockSolverSum, "compute_residual", new=Lorenz96GMRES.compute_residual)
 class TestLorenz96Implicit(unittest.TestCase):
     def test_lorenz96_residual_small(self):
         torch.manual_seed(0)
@@ -493,7 +517,6 @@ class TestLorenz96Implicit(unittest.TestCase):
             tol,
             msg=f"Residual too large: {res_norm.item()} > {tol}",
         )
-
 
 if __name__ == "__main__":
     unittest.main()
