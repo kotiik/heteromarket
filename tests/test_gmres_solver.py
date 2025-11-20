@@ -677,10 +677,10 @@ class TestGMRESvsJAX(unittest.TestCase):
             M_t = torch.tensor(M_mat_np, dtype=dtype)
 
         primals = (A_t, M_t)
-        x_t = StockSolverSum.gmres(
+        x_t = StockSolverSum.gmres_x0(
             b_t,
+            x0_t,
             primals,
-            x0=x0_t,
             tol=1e-6,
             atol=0.0,
             restart=restart,
