@@ -1905,7 +1905,7 @@ class StockSolverSum(ExplicitADFunction):
     GMRES Solver
     """
 
-    @staticmethdo
+    @staticmethod
     def matvec(x_flat: torch.Tensor, mode, primals):
         """
         GMRES wrapper that can apply either J (via jvp) or J^T (via vjp) for StockSolverSum.
@@ -2167,12 +2167,10 @@ class StockSolverSum(ExplicitADFunction):
         # while_loop state must be tensors
         k0 = torch.tensor(0, dtype=torch.int64, device=device)
 
-        if maxiter is None:
-            maxiter_t = torch.tensor(10 * m, device=device, dtype=torch.int64)
-        else:
-            maxiter_t = torch.as_tensor(
-                maxiter, device=device, dtype=torch.int64
-            )
+        maxiter_t = torch.as_tensor(maxiter, device=device, dtype=torch.int64)
+        default_maxiter = torch.as_tensor(10 * m, device=device, dtype=torch.int64)
+        maxiter_t = torch.where(maxiter_t == 0, default_maxiter, maxiter_t)
+
         mode_t = torch.tensor(mode, dtype=torch.int64, device=device)
         restart_shape = torch.zeros((restart,), device=device)
 
