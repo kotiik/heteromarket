@@ -2145,6 +2145,7 @@ class StockSolverSum(ExplicitADFunction):
         maxiter: int = 0,
     ):
         assert b.ndim == 1, "This implementation expects 1D vectors."
+        assert mode == 0 or mode ==1, "Unknown GMRES mode"        
         device, dtype = b.device, b.dtype
         m = b.shape[0]
 
