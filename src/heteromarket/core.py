@@ -2174,9 +2174,10 @@ class StockSolverSum(ExplicitADFunction):
         thresh = torch.maximum(
             torch.as_tensor(tol, dtype=dtype, device=device) * b_norm, atol_t
         )
+        mode_t = torch.tensor(mode, dtype=torch.int64, device=device)
 
         # Initial (left-preconditioned) residual
-        residual0 = StockSolverSum.compute_residual(b, x0, mode, primals)
+        residual0 = StockSolverSum.compute_residual(b, x0, mode_t, primals)
         unit_residual, residual_norm = StockSolverSum._safe_normalize(residual0)
 
         # while_loop state must be tensors
@@ -2186,7 +2187,6 @@ class StockSolverSum(ExplicitADFunction):
         default_maxiter = torch.as_tensor(10 * m, device=device, dtype=torch.int64)
         maxiter_t = torch.where(maxiter_t == 0, default_maxiter, maxiter_t)
 
-        mode_t = torch.tensor(mode, dtype=torch.int64, device=device)
         restart_shape = torch.zeros((restart,), device=device)
 
         x_final, *_ = ops.higher_order.while_loop(
