@@ -2047,20 +2047,22 @@ class StockSolverSum(ExplicitADFunction):
         return V_new, H_new, breakdown
 
     @staticmethod
-    def _loop_cond(V, H, breakdown, k, restart, mode, *_):
+    def _loop_cond(V, H, breakdown, k, restart_shape, mode, *_):
+        restart = restart_shape.shape[0]
         return (k < restart) & (~breakdown)
 
     @staticmethod
-    def _arnoldi_process(V, H, breakdown, k, restart, mode, *primals):
+    def _arnoldi_process(V, H, breakdown, k, restart_shape, mode, *primals):
         V2, H2, breakdown2 = StockSolverSum._kth_arnoldi_iteration(k, V, H, mode, primals)
         return V2, H2, breakdown2, k + 1
 
     @staticmethod
     def _gmres_batched(
-        b, x0, unit_residual, residual_norm, restart, mode, primals
+        b, x0, unit_residual, residual_norm, restart_shape, mode, primals
     ):
         device, dtype = b.device, b.dtype
         m = b.shape[0]
+        restart = restart_shape.shape[0]
         ncols = restart + 1
         # func_wrapper.set_function(f)
 
@@ -2079,7 +2081,7 @@ class StockSolverSum(ExplicitADFunction):
             arnoldi_cond_fun,
             arnoldi_body_fun,
             (V0, H0, br0, k0),
-            (restart, mode) + primals,
+            (restart_shape, mode) + primals,
         )
         # Solve least squares: (Hj^T) y ≈ beta * e1   with Hj = H[:j, :j+1]
         # Fixed-shape LS: solve min || H^T y - beta e1 ||
@@ -2119,15 +2121,15 @@ class StockSolverSum(ExplicitADFunction):
         return x, unit_residual_new, residual_norm_new
 
     @staticmethod
-    def _gmres_cond_fun(x, k, ures, rnorm, b, maxiter, thresh, restart, mode, *_):
+    def _gmres_cond_fun(x, k, ures, rnorm, b, maxiter, thresh, *_):
         return (k < maxiter) & (rnorm > thresh)
 
     @staticmethod
     def _gmres_body_fun(
-        x, k, ures, rnorm, b, maxiter, thresh, restart, mode, *primals
+        x, k, ures, rnorm, b, maxiter, thresh, restart_shape, mode, *primals
     ):
         x_new, ures_new, rnorm_new = StockSolverSum._gmres_batched(
-            b, x, ures, rnorm, restart, mode, primals
+            b, x, ures, rnorm, restart_shape, mode, primals
         )
         return x_new, k + 1, ures_new, rnorm_new
 
@@ -2225,24 +2227,26 @@ class StockSolverSum(ExplicitADFunction):
             maxiter_t = torch.as_tensor(
                 maxiter, device=device, dtype=torch.int64
             )
+        mode_t = torch.tensor(mode, dtype=torch.int64, device=device)
+        restart_shape = torch.zeros((restart,), device=device)
 
         x_final, *_ = ops.higher_order.while_loop(
             gmres_cond_fun,
             gmres_body_fun,
             (x0, k0, unit_residual, residual_norm),
-            (b, maxiter_t, thresh, restart, mode) + primals,
+            (b, maxiter_t, thresh, restart_shape, mode_t) + primals,
         )
         return x_final
 
 # ---------- GMRES outer loop (Newton/GMRES) ----------
 
-def gmres_cond_fun(x, k, ures, rnorm, b, maxiter, thresh, restart, *rest):
+def gmres_cond_fun(x, k, ures, rnorm, b, maxiter, thresh, *rest):
     """
     Wrapper for StockSolverSum._gmres_cond_fun so TorchDynamo sees
     a plain function instead of a class attribute.
     """
     return StockSolverSum._gmres_cond_fun(
-        x, k, ures, rnorm, b, maxiter, thresh, restart, *rest
+        x, k, ures, rnorm, b, maxiter, thresh, *rest
     )
 
 
