@@ -1815,7 +1815,7 @@ def optimize_portfolio(
             _to_float64_preserve_grad(long_leverage).unsqueeze(0),
             _to_float64_preserve_grad(prices),
             torch.zeros_like(expected_returns_t)
-        )
+        ).squeeze(0)
     else:
         expected_returns_t = _to_float64_preserve_grad(expected_returns)
         return StockSolverFunc.apply(
@@ -2564,13 +2564,6 @@ class ImplicitFunction(ExplicitADFunction):
 class PriceSolver(ImplicitFunction):
     func = StockSolverSum
     variable_input = 8
-
-
-def _to_float64_preserve_grad(x):
-    """Cast to float64 without detaching; create tensor only if needed."""
-    if isinstance(x, torch.Tensor):
-        return x if x.dtype == torch.float64 else x.to(torch.float64)
-    return torch.as_tensor(x, dtype=torch.float64)
 
 
 @torch.compile
