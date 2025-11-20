@@ -1905,8 +1905,8 @@ class StockSolverSum(ExplicitADFunction):
     GMRES Solver
     """
 
-    @classmethod
-    def matvec(cls, x_flat: torch.Tensor, mode, primals):
+    @staticmethdo
+    def matvec(x_flat: torch.Tensor, mode, primals):
         """
         GMRES wrapper that can apply either J (via jvp) or J^T (via vjp) for StockSolverSum.
         """
@@ -2134,10 +2134,60 @@ class StockSolverSum(ExplicitADFunction):
         return x_new, k + 1, ures_new, rnorm_new
 
     @staticmethod
+    def gmres_x0(
+        b: torch.Tensor,
+        x0: torch.Tensor,
+        primals,
+        tol: float = 1e-5,
+        atol: float = 0.0,
+        restart: int = 20,
+        mode: int = 0, # 0 or 1
+        maxiter: int = 0,
+    ):
+        assert b.ndim == 1, "This implementation expects 1D vectors."
+        device, dtype = b.device, b.dtype
+        m = b.shape[0]
+
+        restart = int(min(restart, m))
+
+        if x0.shape != b.shape:
+            raise ValueError("x0 and b must have matching shape")
+
+        # Build tensor tolerances
+        b_norm = torch.linalg.vector_norm(b)
+        atol_t = torch.as_tensor(atol, dtype=dtype, device=device)
+        thresh = torch.maximum(
+            torch.as_tensor(tol, dtype=dtype, device=device) * b_norm, atol_t
+        )
+
+        # Initial (left-preconditioned) residual
+        residual0 = StockSolverSum.compute_residual(b, x0, 0, primals)
+        unit_residual, residual_norm = StockSolverSum._safe_normalize(residual0)
+
+        # while_loop state must be tensors
+        k0 = torch.tensor(0, dtype=torch.int64, device=device)
+
+        if maxiter is None:
+            maxiter_t = torch.tensor(10 * m, device=device, dtype=torch.int64)
+        else:
+            maxiter_t = torch.as_tensor(
+                maxiter, device=device, dtype=torch.int64
+            )
+        mode_t = torch.tensor(mode, dtype=torch.int64, device=device)
+        restart_shape = torch.zeros((restart,), device=device)
+
+        x_final, *_ = ops.higher_order.while_loop(
+            gmres_cond_fun,
+            gmres_body_fun,
+            (x0, k0, unit_residual, residual_norm),
+            (b, maxiter_t, thresh, restart_shape, mode_t) + primals,
+        )
+        return x_final
+
+    @staticmethod
     def gmres(
         b: torch.Tensor,
         primals,
-        x0: torch.Tensor | None = None,
         tol: float = 1e-5,
         atol: float = 0.0,
         restart: int = 20,
@@ -2191,48 +2241,9 @@ class StockSolverSum(ExplicitADFunction):
             Default is infinite.
         """
 
-        assert b.ndim == 1, "This implementation expects 1D vectors."
-        device, dtype = b.device, b.dtype
-        m = b.shape[0]
+        x0 = torch.zeros_like(b)
+        return StockSolverSum.gmres_x0(b, x0, primals, tol, atol, restart, mode, maxiter)
 
-        if x0 is None:
-            x0 = torch.zeros_like(b)
-
-        restart = int(min(restart, m))
-
-        if x0.shape != b.shape:
-            raise ValueError("x0 and b must have matching shape")
-
-        # Build tensor tolerances
-        b_norm = torch.linalg.vector_norm(b)
-        atol_t = torch.as_tensor(atol, dtype=dtype, device=device)
-        thresh = torch.maximum(
-            torch.as_tensor(tol, dtype=dtype, device=device) * b_norm, atol_t
-        )
-
-        # Initial (left-preconditioned) residual
-        residual0 = StockSolverSum.compute_residual(b, x0, 0, primals)
-        unit_residual, residual_norm = StockSolverSum._safe_normalize(residual0)
-
-        # while_loop state must be tensors
-        k0 = torch.tensor(0, dtype=torch.int64, device=device)
-
-        if maxiter is None:
-            maxiter_t = torch.tensor(10 * m, device=device, dtype=torch.int64)
-        else:
-            maxiter_t = torch.as_tensor(
-                maxiter, device=device, dtype=torch.int64
-            )
-        mode_t = torch.tensor(mode, dtype=torch.int64, device=device)
-        restart_shape = torch.zeros((restart,), device=device)
-
-        x_final, *_ = ops.higher_order.while_loop(
-            gmres_cond_fun,
-            gmres_body_fun,
-            (x0, k0, unit_residual, residual_norm),
-            (b, maxiter_t, thresh, restart_shape, mode_t) + primals,
-        )
-        return x_final
 
 # ---------- GMRES outer loop (Newton/GMRES) ----------
 
@@ -2405,7 +2416,6 @@ class ImplicitFunction(ExplicitADFunction):
             dx_flat = StockSolverSum.gmres(
                 b=(-r).reshape(-1),
                 primals=primals,
-                x0=None,
                 tol=cls._gmres_tol,
                 atol=cls._gmres_atol,
                 restart=cls._gmres_restart,
@@ -2496,7 +2506,6 @@ class ImplicitFunction(ExplicitADFunction):
         w_flat = StockSolverSum.gmres(
             b=bar_xvar.reshape(-1),
             primals=primals_F,
-            x0=None,
             tol=cls._gmres_tol,
             atol=cls._gmres_atol,
             restart=cls._gmres_restart,
