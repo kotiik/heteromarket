@@ -2150,7 +2150,9 @@ class StockSolverSum(ExplicitADFunction):
         )
 
         # Initial (left-preconditioned) residual
-        residual0 = StockSolverSum.compute_residual(b, x0, 0, primals)
+        residual0 = StockSolverSum.compute_residual(
+            b, x0, torch.as_tensor(0, dtype=torch.float64, device=device), primals
+        )
         unit_residual, residual_norm = StockSolverSum._safe_normalize(residual0)
 
         # while_loop state must be tensors
@@ -2547,6 +2549,7 @@ def _to_float64_preserve_grad(x):
     return torch.as_tensor(x, dtype=torch.float64)
 
 
+@torch.compile
 def find_equilibrium_prices(
     Sigma,
     expected_returns,
