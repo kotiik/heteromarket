@@ -1920,19 +1920,7 @@ class StockSolverSum(ExplicitADFunction):
         n = p.shape[-1]
         v = x_flat.view(n)   # Jacobian acts on shape (n,)
 
-        if mode == 0:
-            # J @ v  via forward-mode
-            tangents = (None, None, None, None, None, None, None, v, None)
-            (dy,) = StockSolverSum.jvp_from_primals(saved, *tangents)
-            return dy.reshape(-1)
-        elif mode == 1:
-            # J^T @ v via reverse-mode
-            grads = StockSolverSum.vjp_from_primals(saved, v, needs_input_grad=None)
-            g_p = grads[7]   # gradient w.r.t. price input
-            return g_p.reshape(-1)
-        else:
-            raise ValueError(f"Unknown GMRES kind")
-
+        return torch.cond(mode == 0, matvec_jvp_branch, matvec_vjp_branch, (v, saved))
 
     @staticmethod
     def compute_residual(b, x, mode, primals):
@@ -2283,6 +2271,18 @@ def arnoldi_body_fun(V, H, breakdown, k, restart, mode, *primals):
     return StockSolverSum._arnoldi_process(
         V, H, breakdown, k, restart, mode, *primals
     )
+
+
+def matvec_jvp_branch(v, saved):
+    tangents = (None, None, None, None, None, None, None, v, None)
+    (dy,) = StockSolverSum.jvp_from_primals(saved, *tangents)
+    return dy.reshape(-1)        
+
+
+def matvec_vjp_branch(v, saved):
+    grads = StockSolverSum.vjp_from_primals(saved, v, needs_input_grad=None)
+    g_p = grads[7]   # gradient w.r.t. price input
+    return g_p.reshape(-1)
 
 
 class ImplicitFunction(ExplicitADFunction):
