@@ -2111,12 +2111,11 @@ class StockSolverSum(ExplicitADFunction):
         x = x0 + dx
 
         # New (preconditioned) residual
-        residual = StockSolverSum.compute_residual(b, x, 0, primals)
+        residual = StockSolverSum.compute_residual(b, x, mode, primals)
 
         unit_residual_new, residual_norm_new = StockSolverSum._safe_normalize(
             residual
         )
-
         return x, unit_residual_new, residual_norm_new
 
     @staticmethod
@@ -2366,29 +2365,15 @@ class ImplicitFunction(ExplicitADFunction):
             primals = Func.compute_primals(*xs, outputs=y_cur)
             x_shape = x_var.shape
 
-            class _J(StockSolverSum):
-                @classmethod
-                def matvec(cls2, v_flat, primals_):
-                    v = v_flat.view(x_shape)
-                    tangents = tuple(
-                        v if j == var_i else None for j in range(len(xs))
-                    )
-                    Jy = Func.jvp_from_primals(primals_, *tangents)
-                    Jy = ImplicitFunction._unwrap_single(Jy)
-                    return Jy.reshape(-1)
-
-                @classmethod
-                def compute_residual(cls2, b, x, primals_):
-                    return b - cls2.matvec(x, primals_)
-
             # Solve J Δ = -r
-            dx_flat = _J.gmres(
+            dx_flat = StockSolverSum.gmres(
                 b=(-r).reshape(-1),
                 primals=primals,
                 x0=None,
                 tol=cls._gmres_tol,
                 atol=cls._gmres_atol,
                 restart=cls._gmres_restart,
+                mode=0,
                 maxiter=cls._gmres_maxiter,
             )
             dx = dx_flat.view_as(x_var)
@@ -2471,27 +2456,15 @@ class ImplicitFunction(ExplicitADFunction):
         shape_y = saved["shape_y"]
         Func = cls.func
 
-        class _JT(StockSolverSum):
-            @classmethod
-            def matvec(cls2, v_flat, primals_):
-                v_y = v_flat.view(shape_y)
-                # func is assumed single-output: pass one cotangent
-                grads = Func.vjp_from_primals(primals_, v_y)
-                g_var = grads[var_i]  # (∂F/∂x_var)^T v_y
-                return g_var.reshape(-1)
-
-            @classmethod
-            def compute_residual(cls2, b, x, primals_):
-                return b - cls2.matvec(x, primals_)
-
         # Solve J^T w = bar_xvar
-        w_flat = _JT.gmres(
+        w_flat = StockSolverSum.gmres(
             b=bar_xvar.reshape(-1),
             primals=primals_F,
             x0=None,
             tol=cls._gmres_tol,
             atol=cls._gmres_atol,
             restart=cls._gmres_restart,
+            mode=1,
             maxiter=cls._gmres_maxiter,
         )
         w = w_flat.view(shape_y)
