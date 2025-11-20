@@ -1527,7 +1527,7 @@ class StockSolverFunc(ExplicitADFunction):
             )
 
         # ---- Primal call ----
-        outputs = ActiveSetQPFunc.apply(Q, m1, c, wl, wh, L, U, p0, x0_adj)
+        outputs = ActiveSetQPFunc.compute(Q, m1, c, wl, wh, L, U, p0, x0_adj)
         x = outputs[0]
 
         # ---- JVP of the QP solve (single linearized KKT solve) ----
