@@ -2,7 +2,14 @@ import torch
 from torch import ops
 import torch.nn.functional as functional
 from typing import Any, Tuple, Sequence, NamedTuple, Callable, Tuple
+import warnings
 
+# suppress torch compilation warning
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r".*torch\._prims_common\.check.*"
+)
 
 def _as_tuple(x):
     return x if isinstance(x, tuple) else (x,)
